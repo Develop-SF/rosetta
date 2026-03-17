@@ -42,18 +42,45 @@ from rcl_interfaces.msg import ParameterDescriptor
 
 from lerobot.async_inference.configs import RobotClientConfig
 from lerobot.async_inference.robot_client import RobotClient
+from lerobot.processor import RobotProcessorPipeline
+from lerobot.processor.converters import (
+    observation_to_transition,
+    transition_to_observation,
+)
 from rosetta_interfaces.action import RunPolicy
 
 from lerobot_robot_rosetta import RosettaConfig
 from lerobot_robot_rosetta.rosetta import _TopicBridge
 
 from .common.ros2_utils import is_jazzy_or_newer
+from .common import processors as _processors  # noqa: F401
 
 SERVER_STARTUP_TIMEOUT_SEC = 30.0
 SERVER_STARTUP_POLL_SEC = 0.5
 SERVER_STOP_TIMEOUT_SEC = 5.0
 THREAD_JOIN_TIMEOUT_SEC = 2.0
 FEEDBACK_THREAD_JOIN_TIMEOUT_SEC = 1.0
+
+
+class _ObsProcessingRobotWrapper:
+    """Wraps a robot to apply an observation processor on get_observation().
+
+    This avoids modifying RobotClient: the processor is injected at the robot
+    layer so RobotClient.control_loop_observation() receives already-processed
+    observations without any knowledge of the processor.
+    """
+
+    def __init__(self, robot, processor):
+        self._robot = robot
+        self._processor = processor
+
+    def get_observation(self):
+        obs = self._robot.get_observation()
+        return self._processor(obs)
+
+    def __getattr__(self, name):
+        # Transparently delegate everything else (action_features, send_action, etc.)
+        return getattr(self._robot, name)
 
 
 class RosettaClientNode(LifecycleNode):
@@ -72,65 +99,104 @@ class RosettaClientNode(LifecycleNode):
         # Parameters with descriptors for introspection (ros2 param describe)
         # Read-only parameters are set once at startup and cannot be changed
         self.declare_parameter(
-            "contract_path", "",
-            ParameterDescriptor(description="Path to contract YAML file", read_only=True)
+            "contract_path",
+            "",
+            ParameterDescriptor(
+                description="Path to contract YAML file", read_only=True
+            ),
         )
         self.declare_parameter(
-            "pretrained_name_or_path", "",
-            ParameterDescriptor(description="Path or HF repo ID of trained policy", read_only=True)
+            "pretrained_name_or_path",
+            "",
+            ParameterDescriptor(
+                description="Path or HF repo ID of trained policy", read_only=True
+            ),
         )
         self.declare_parameter(
-            "server_address", "127.0.0.1:8080",
-            ParameterDescriptor(description="Policy server address (host:port)", read_only=True)
+            "server_address",
+            "127.0.0.1:8080",
+            ParameterDescriptor(
+                description="Policy server address (host:port)", read_only=True
+            ),
         )
         self.declare_parameter(
-            "policy_type", "act",
-            ParameterDescriptor(description="Policy architecture (act, diffusion, etc.)", read_only=True)
+            "policy_type",
+            "act",
+            ParameterDescriptor(
+                description="Policy architecture (act, diffusion, etc.)", read_only=True
+            ),
         )
         self.declare_parameter(
-            "policy_device", "cuda",
-            ParameterDescriptor(description="Device for policy inference (cuda, cpu)", read_only=True)
+            "policy_device",
+            "cuda",
+            ParameterDescriptor(
+                description="Device for policy inference (cuda, cpu)", read_only=True
+            ),
         )
         self.declare_parameter(
-            "actions_per_chunk", 50,
-            ParameterDescriptor(description="Number of actions to request per chunk")
+            "actions_per_chunk",
+            50,
+            ParameterDescriptor(description="Number of actions to request per chunk"),
         )
         self.declare_parameter(
-            "chunk_size_threshold", 0.5,
-            ParameterDescriptor(description="Queue threshold ratio to request new chunk (0.0-1.0)")
+            "chunk_size_threshold",
+            0.5,
+            ParameterDescriptor(
+                description="Queue threshold ratio to request new chunk (0.0-1.0)"
+            ),
         )
         self.declare_parameter(
-            "aggregate_fn_name", "weighted_average",
-            ParameterDescriptor(description="Action aggregation function (weighted_average, etc.)")
+            "aggregate_fn_name",
+            "weighted_average",
+            ParameterDescriptor(
+                description="Action aggregation function (weighted_average, etc.)"
+            ),
         )
         self.declare_parameter(
-            "feedback_rate_hz", 2.0,
-            ParameterDescriptor(description="Rate for publishing action feedback")
+            "feedback_rate_hz",
+            2.0,
+            ParameterDescriptor(description="Rate for publishing action feedback"),
         )
         self.declare_parameter(
-            "launch_local_server", True,
-            ParameterDescriptor(description="Launch local policy server subprocess", read_only=True)
+            "launch_local_server",
+            True,
+            ParameterDescriptor(
+                description="Launch local policy server subprocess", read_only=True
+            ),
         )
         self.declare_parameter(
-            "obs_similarity_atol", 1.0,
-            ParameterDescriptor(description="L2 norm tolerance for observation similarity (-1.0 to disable)")
+            "obs_similarity_atol",
+            1.0,
+            ParameterDescriptor(
+                description="L2 norm tolerance for observation similarity (-1.0 to disable)"
+            ),
         )
         self.declare_parameter(
-            "is_classifier", False,
+            "is_classifier",
+            False,
             ParameterDescriptor(
                 description="Use reward section as action output (for reward classifiers)",
                 read_only=True,
-            )
+            ),
         )
         self.declare_parameter(
-            "sim_time_multiplier", 1.0,
+            "sim_time_multiplier",
+            1.0,
             ParameterDescriptor(
                 description="Multiplier for fps sent to LeRobot (contract_fps * sim_time_multiplier). "
                 "Use values < 1.0 for slow sims (e.g., 0.5 for 0.5x speed sim) to maintain wall-time action rate. "
                 "Set to 1.0 for real-time or when not using sim time."
-            )
+            ),
         )
-
+        self.declare_parameter(
+            "observation_processor_path",
+            "",
+            ParameterDescriptor(
+                description="Path to saved RobotObservationProcessor JSON config. "
+                "If empty, uses identity processor (no transform).",
+                read_only=True,
+            ),
+        )
         # Initialize state variables (resources created in lifecycle callbacks)
         self._contract_path: str | None = None
         self._pretrained: str | None = None
@@ -161,7 +227,7 @@ class RosettaClientNode(LifecycleNode):
             return TransitionCallbackReturn.FAILURE
         # Distinguish local paths from HF repo IDs (e.g. "user/model").
         # Local paths start with /, ./, or ../
-        _looks_local = self._pretrained.startswith(('/', './', '../'))
+        _looks_local = self._pretrained.startswith(("/", "./", "../"))
         if _looks_local and not os.path.isdir(self._pretrained):
             self.get_logger().error(
                 f"Local model path does not exist: {self._pretrained}. "
@@ -174,7 +240,8 @@ class RosettaClientNode(LifecycleNode):
         # ROS2 clock respects use_sim_time and /clock, so watchdog operates in sim time
         is_classifier = self.get_parameter("is_classifier").value
         self._rosetta_config = RosettaConfig(
-            id="rosetta", config_path=self._contract_path,
+            id="rosetta",
+            config_path=self._contract_path,
             is_classifier=is_classifier,
         )
         self._bridge = _TopicBridge(self._rosetta_config)
@@ -306,7 +373,9 @@ class RosettaClientNode(LifecycleNode):
         self.get_logger().info(f"Launching {module} on {host}:{port}...")
 
         cmd = [
-            sys.executable, "-m", module,
+            sys.executable,
+            "-m",
+            module,
             f"--host={host}",
             f"--port={port}",
         ]
@@ -316,7 +385,9 @@ class RosettaClientNode(LifecycleNode):
         start_time = time.time()
         while time.time() - start_time < SERVER_STARTUP_TIMEOUT_SEC:
             if self._server_process.poll() is not None:
-                raise RuntimeError(f"Policy server exited with code {self._server_process.returncode}")
+                raise RuntimeError(
+                    f"Policy server exited with code {self._server_process.returncode}"
+                )
 
             try:
                 with socket.create_connection((host, int(port)), timeout=1.0):
@@ -325,7 +396,9 @@ class RosettaClientNode(LifecycleNode):
             except (ConnectionRefusedError, socket.timeout, OSError):
                 time.sleep(SERVER_STARTUP_POLL_SEC)
 
-        raise RuntimeError(f"Policy server failed to start within {SERVER_STARTUP_TIMEOUT_SEC}s")
+        raise RuntimeError(
+            f"Policy server failed to start within {SERVER_STARTUP_TIMEOUT_SEC}s"
+        )
 
     def _stop_policy_server(self) -> None:
         """Terminate the policy server process."""
@@ -371,6 +444,9 @@ class RosettaClientNode(LifecycleNode):
             config = self._build_config(task)
             client = RobotClient(config)
             self._client = client
+            processor = self._build_observation_processor()
+            if processor is not None:
+                client.robot = _ObsProcessingRobotWrapper(client.robot, processor)
 
             if not client.start():
                 result.success = False
@@ -440,9 +516,9 @@ class RosettaClientNode(LifecycleNode):
             # use_sim_time=self.get_parameter("use_sim_time").value,
         )
         robot_config._external_bridge = self._bridge  # Inject pre-built bridge
-        
+
         # Apply sim_time_multiplier to control loop fps
-        # 
+        #
         # Architecture:
         #   - Contract fps (10Hz): Rate at which observations are resampled (sim time)
         #   - RobotClient fps: Rate at which control_loop() polls for observations (wall time)
@@ -457,7 +533,7 @@ class RosettaClientNode(LifecycleNode):
         contract_fps = robot_config.fps
         sim_multiplier = self.get_parameter("sim_time_multiplier").value
         control_loop_fps = int(contract_fps * sim_multiplier)
-        
+
         if sim_multiplier != 1.0:
             self.get_logger().info(
                 f"Applied sim_time_multiplier={sim_multiplier:.2f}: "
@@ -484,10 +560,13 @@ class RosettaClientNode(LifecycleNode):
         # by much less than 1.0 between frames, causing most observations to be
         # filtered out and breaking inference. Set to -1.0 to disable filtering.
         obs_similarity_atol_param = self.get_parameter("obs_similarity_atol").value
-        obs_similarity_atol = None if obs_similarity_atol_param < 0 else obs_similarity_atol_param
+        obs_similarity_atol = (
+            None if obs_similarity_atol_param < 0 else obs_similarity_atol_param
+        )
 
         # Check if this LeRobot version supports obs_similarity_atol
         from dataclasses import fields
+
         supported_fields = {f.name for f in fields(RobotClientConfig)}
 
         if "obs_similarity_atol" in supported_fields:
@@ -516,6 +595,23 @@ class RosettaClientNode(LifecycleNode):
 
         self.get_logger().info(f"Finished: {result.message}")
         return result
+
+    def _build_observation_processor(self) -> RobotProcessorPipeline | None:
+        """Load observation processor from ROS2 parameter, or return None."""
+        processor_path = self.get_parameter("observation_processor_path").value
+
+        if not processor_path:
+            self.get_logger().debug("No observation_processor_path set, skipping")
+            return None
+
+        self.get_logger().info(f"Loading observation processor from: {processor_path}")
+
+        return RobotProcessorPipeline.from_pretrained(
+            processor_path,
+            config_filename="robot_observation_processor.json",
+            to_transition=observation_to_transition,
+            to_output=transition_to_observation,
+        )
 
 
 def main(args=None):
