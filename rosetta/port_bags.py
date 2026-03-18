@@ -472,11 +472,17 @@ def _stream_frames_from_bag(
     topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
+    # Filter reader to only yield messages for contract topics, skipping all others
+    reader.set_filter(rosbag2_py.StorageFilter(topics=list(buffers.keys())))
+
     start_ns, end_ns = _get_bag_time_bounds_ns(reader)
     n_frames = max(1, int((end_ns - start_ns) // step_ns) + 1)
 
     current_tick_idx = 0
     current_tick_ns = start_ns
+    # Skip the first tick — buffers are empty so it would always be zeros
+    current_tick_idx = 1
+    current_tick_ns = start_ns + step_ns
     header_warned: set[str] = set()
 
     while reader.has_next():
