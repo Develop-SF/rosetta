@@ -480,16 +480,27 @@ def _stream_frames_from_bag(
 
     current_tick_idx = 0
     current_tick_ns = start_ns
-    # Skip the first tick — buffers are empty so it would always be zeros
-    current_tick_idx = 1
-    current_tick_ns = start_ns + step_ns
+    # frames_emitted tracks how many frames have actually been yielded.
+    # is_first is set on the very first emitted frame (when all buffers are populated),
+    # not necessarily on tick index 0, to handle per-topic startup latency.
+    frames_emitted = 0
     header_warned: set[str] = set()
+
+    def _all_buffers_ready() -> bool:
+        """Return True once every topic buffer has received at least one message."""
+        return all(buf.last_ts is not None for _, buf in buffers.values())
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
 
         # Emit frames whose tick time has passed
         while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
+            # Hold back emission until all buffers have at least one sample
+            if not _all_buffers_ready():
+                current_tick_idx += 1
+                current_tick_ns = start_ns + current_tick_idx * step_ns
+                continue
+
             # Use processor path if processors provided, otherwise use direct sampling
             if obs_processor is not None or action_processor is not None:
                 # Sample into robot-style dicts
@@ -507,7 +518,7 @@ def _stream_frames_from_bag(
                 # Direct sampling (original path, no processor overhead)
                 frame = _sample_frame(current_tick_ns, buffers)
 
-            frame["is_first"] = np.array([current_tick_idx == 0], dtype=bool)
+            frame["is_first"] = np.array([frames_emitted == 0], dtype=bool)
             frame["is_last"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
             frame["is_terminal"] = np.array(
                 [current_tick_idx == n_frames - 1], dtype=bool
@@ -515,6 +526,7 @@ def _stream_frames_from_bag(
             frame["task"] = prompt
 
             yield frame
+            frames_emitted += 1
 
             current_tick_idx += 1
             current_tick_ns = start_ns + current_tick_idx * step_ns
@@ -540,7 +552,7 @@ def _stream_frames_from_bag(
             if val is not None:
                 buffer.push(ts, val)
 
-    # Emit remaining frames
+    # Emit remaining frames after all bag messages are consumed
     while current_tick_idx < n_frames:
         # Use processor path if processors provided
         if obs_processor is not None or action_processor is not None:
@@ -553,12 +565,13 @@ def _stream_frames_from_bag(
         else:
             frame = _sample_frame(current_tick_ns, buffers)
 
-        frame["is_first"] = np.array([current_tick_idx == 0], dtype=bool)
+        frame["is_first"] = np.array([frames_emitted == 0], dtype=bool)
         frame["is_last"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
         frame["is_terminal"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
         frame["task"] = prompt
 
         yield frame
+        frames_emitted += 1
 
         current_tick_idx += 1
         current_tick_ns = start_ns + current_tick_idx * step_ns
