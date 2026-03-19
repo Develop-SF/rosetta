@@ -128,6 +128,46 @@ def _enc_twist_stamped(
 
 
 # =============================================================================
+# PointStamped Encoder
+# =============================================================================
+
+
+@register_encoder("geometry_msgs/msg/PointStamped")
+def _enc_point_stamped(
+    action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | None = None
+) -> Any:
+    """Encode to geometry_msgs/PointStamped.
+
+    With selector.names like ['point.x', 'point.y', 'point.z']:
+      - Maps values to specified fields on the message
+    Without names:
+      - Maps action vector to [point.x, point.y, point.z] in order
+    """
+    msg_cls = get_message("geometry_msgs/msg/PointStamped")
+    msg = msg_cls()
+    _set_header_stamp(msg, stamp_ns)
+
+    arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
+
+    if not spec.names:
+        if len(arr) > 0:
+            msg.point.x = float(arr[0])
+        if len(arr) > 1:
+            msg.point.y = float(arr[1])
+        if len(arr) > 2:
+            msg.point.z = float(arr[2])
+        return msg
+
+    if len(spec.names) != len(arr):
+        raise ValueError(f"names length ({len(spec.names)}) != action length ({len(arr)})")
+
+    for i, path in enumerate(spec.names):
+        dot_set(msg, path, arr[i])
+
+    return msg
+
+
+# =============================================================================
 # Scalar Encoders
 # =============================================================================
 
