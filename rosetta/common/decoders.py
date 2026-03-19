@@ -409,6 +409,29 @@ def _dec_twist_stamped(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
 
 
 # =============================================================================
+# PointStamped Decoder
+# =============================================================================
+
+
+@register_decoder("geometry_msgs/msg/PointStamped", dtype="float64")
+def _dec_point_stamped(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode geometry_msgs/PointStamped.
+
+    With selector names: extracts specified dotted paths from the message
+      e.g. ['point.x', 'point.y', 'point.z'] or ['point.x']
+    Without names: returns [x, y, z]
+    """
+    if not spec.names:
+        return np.array(
+            [msg.point.x, msg.point.y, msg.point.z], dtype=np.float64
+        )
+
+    return np.asarray(
+        [float(dot_get(msg, name)) for name in spec.names], dtype=np.float64
+    )
+
+
+# =============================================================================
 # MultiDOFCommand Decoder
 # =============================================================================
 
