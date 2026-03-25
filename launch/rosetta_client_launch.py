@@ -67,6 +67,7 @@ def launch_setup(context, *args, **kwargs):
     params_file = LaunchConfiguration('params_file').perform(context)
     contract_path = LaunchConfiguration('contract_path').perform(context)
     pretrained_name_or_path = LaunchConfiguration('pretrained_name_or_path').perform(context)
+    policy_type = LaunchConfiguration('policy_type').perform(context)
     server_address = LaunchConfiguration('server_address').perform(context)
     launch_local_server = LaunchConfiguration('launch_local_server').perform(context)
     use_sim_time = LaunchConfiguration('use_sim_time').perform(context)
@@ -80,6 +81,9 @@ def launch_setup(context, *args, **kwargs):
     
     if pretrained_name_or_path:  # Only add if non-empty
         overrides['pretrained_name_or_path'] = pretrained_name_or_path
+    
+    if policy_type:  # Only add if non-empty
+        overrides['policy_type'] = policy_type
     
     if server_address:  # Only add if non-empty
         overrides['server_address'] = server_address
@@ -173,6 +177,11 @@ def generate_launch_description():
             'pretrained_name_or_path',
             default_value='',  # Empty = use value from params file
             description='Path or HF repo ID of trained policy (empty = use params file value)'
+        ),
+        DeclareLaunchArgument(
+            'policy_type',
+            default_value='',  # Empty = use value from params file
+            description='Policy architecture type (act, diffusion, etc., empty = use params file value)'
         ),
         # Server configuration
         DeclareLaunchArgument(
