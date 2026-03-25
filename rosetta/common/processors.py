@@ -129,7 +129,7 @@ class NumpyImageCropResizeProcessorStep(ObservationProcessorStep):
             return features
         for key in features.get(PipelineFeatureType.OBSERVATION, {}):
             feat = features[PipelineFeatureType.OBSERVATION][key]
-            if len(feat.shape) == 3:  # (C, H, W) or (H, W, C)
+            if len(feat.shape) == 3:  # (C, H, W)
                 nb_channel = feat.shape[0]
                 features[PipelineFeatureType.OBSERVATION][key] = PolicyFeature(
                     type=feat.type,

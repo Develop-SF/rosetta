@@ -11,17 +11,29 @@
 
 ## Table of Contents
 
-- [Recent Changes](#recent-changes)
+- [Table of Contents](#table-of-contents)
 - [Quick Start](#quick-start)
+  - [Inference on Emily in Isaac Sim](#inference-on-emily-in-isaac-sim)
 - [Core Concepts](#core-concepts)
   - [What is LeRobot?](#what-is-lerobot)
   - [What is Rosetta?](#what-is-rosetta)
 - [Architecture](#architecture)
+  - [LeRobot Plugin Architecture](#lerobot-plugin-architecture)
+  - [ROS2 Lifecycle Integration](#ros2-lifecycle-integration)
+  - [Policy Inference](#policy-inference)
+  - [rosetta\_ws Workspace](#rosetta_ws-workspace)
 - [The Contract](#the-contract)
 - [Recording Episodes](#recording-episodes)
   - [Why Record to Bag Files?](#why-record-to-bag-files)
 - [Converting Bags to Datasets](#converting-bags-to-datasets)
+  - [Relationship to LeRobot](#relationship-to-lerobot)
+  - [Basic Usage](#basic-usage)
 - [Training a Policy](#training-a-policy)
+  - [Quick Start: ACT](#quick-start-act)
+  - [Fine-tuning VLA Models](#fine-tuning-vla-models)
+  - [Multi-GPU Training](#multi-gpu-training)
+  - [Resume Training](#resume-training)
+  - [Upload to HuggingFace Hub](#upload-to-huggingface-hub)
   - [Supported Policies](#supported-policies)
 - [Deploying Policies](#deploying-policies)
 - [Contract Reference](#contract-reference)
@@ -35,11 +47,24 @@
   - [Alignment Strategies](#alignment-strategies)
   - [Supported Message Types](#supported-message-types)
   - [Custom Encoders/Decoders (Experimental)](#custom-encodersdecoders-experimental)
+    - [Method 1: Specify in Contract (Recommended)](#method-1-specify-in-contract-recommended)
+    - [Method 2: Global Registration](#method-2-global-registration)
+    - [Function Signatures](#function-signatures)
+    - [When Each Is Used](#when-each-is-used)
 - [LeRobot Data Model Reference](#lerobot-data-model-reference)
   - [Key System](#key-system)
+    - [How LeRobot classifies keys](#how-lerobot-classifies-keys)
+    - [Convention vs. compatibility](#convention-vs-compatibility)
   - [EnvTransition](#envtransition)
+    - [Observation (`observation.*`)](#observation-observation)
+    - [Action (`action*`)](#action-action)
+    - [Task and Language](#task-and-language)
+    - [Reward and Episode Signals](#reward-and-episode-signals)
+    - [Complementary Data](#complementary-data)
+    - [Info](#info)
   - [Data Types](#data-types)
   - [Policy Feature Compatibility](#policy-feature-compatibility)
+    - [What this means for your contract](#what-this-means-for-your-contract)
 - [License](#license)
 
 <a id="recent-changes"></a>
@@ -149,6 +174,36 @@ ros2 action send_goal /rosetta_client/run_policy \
     rosetta_interfaces/action/RunPolicy "{prompt: 'pick up red block'}"
 ```
 
+### Inference on Emily in Isaac Sim
+
+> DO NOT launch the sns_autonomy!
+
+Launch the Rosetta client with the appropriate contract and pretrained policy checkpoint:
+* ACT
+  ```bash
+  ros2 launch rosetta rosetta_client_launch.py \
+    contract_path:=/root/ws_rl/src/sns_robot_learning/src/sns_robot_learning/rosetta_contracts/inference/emily_infer.yaml \
+    pretrained_name_or_path:=src/policies/emily/pickplace_sim_act/checkpoints/last/pretrained_model \
+    policy_type:=act
+  # isaac
+  ros2 launch rosetta rosetta_client_launch.py \
+    contract_path:=/root/ws_rl/src/sns_robot_learning/src/sns_robot_learning/rosetta_contracts/inference/emily_isaac_infer.yaml \
+    pretrained_name_or_path:=src/policies/emily/pickplace_sim_act/checkpoints/last/pretrained_model \
+    policy_type:=act
+  ```
+* Diffusion Policy
+  ```
+  ros2 launch rosetta rosetta_client_launch.py \
+    contract_path:=/root/ws_rl/src/sns_robot_learning/src/sns_robot_learning/rosetta_contracts/record/emily_isaac_infer.yaml \
+    pretrained_name_or_path:=src/policies/emily/pickplace_sim_dp/checkpoints/last/pretrained_model \
+    policy_type:=diffusion
+  ```
+* Start inference:
+  ```
+  ros2 action send_goal /run_policy     rosetta_interfaces/action/RunPolicy "{prompt: ''}"
+  ```
+
+
 ---
 
 ## Core Concepts
@@ -165,13 +220,13 @@ Rosetta is a set of ROS2 packages and tools to bring state-of-the-art robot lear
 
 Rosetta consists of five packages that implement LeRobot's official interfaces:
 
-| Package | Purpose |
-|---------|---------|
-| `rosetta` | Core library, nodes, bag conversion |
-| [`rosetta_interfaces`](https://github.com/iblnkn/rosetta_interfaces) | ROS2 action/service definitions |
-| [`lerobot_robot_rosetta`](https://github.com/iblnkn/lerobot-robot-rosetta) | LeRobot Robot plugin |
-| [`lerobot_teleoperator_rosetta`](https://github.com/iblnkn/lerobot-teleoperator-rosetta) | LeRobot Teleoperator plugin (experimental) |
-| `rosetta_rl` | HIL-SERL reinforcement learning (coming soon) |
+| Package                                                                                  | Purpose                                       |
+| ---------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `rosetta`                                                                                | Core library, nodes, bag conversion           |
+| [`rosetta_interfaces`](https://github.com/iblnkn/rosetta_interfaces)                     | ROS2 action/service definitions               |
+| [`lerobot_robot_rosetta`](https://github.com/iblnkn/lerobot-robot-rosetta)               | LeRobot Robot plugin                          |
+| [`lerobot_teleoperator_rosetta`](https://github.com/iblnkn/lerobot-teleoperator-rosetta) | LeRobot Teleoperator plugin (experimental)    |
+| `rosetta_rl`                                                                             | HIL-SERL reinforcement learning (coming soon) |
 
 ```
 rosetta/
@@ -206,11 +261,11 @@ This means any ROS2 robot can use LeRobot's tools. Define a contract and use `--
 
 LeRobot's `connect()` / `disconnect()` map to ROS2 lifecycle transitions:
 
-| LeRobot Method | Lifecycle Transition | Effect |
-|----------------|---------------------|--------|
-| - | `configure` | Create subscriptions (start buffering), create publishers (disabled) |
-| `connect()` | `activate` | Enable publishers, start watchdog |
-| `disconnect()` | `deactivate` → `cleanup` | Safety action, disable publishers, destroy resources |
+| LeRobot Method | Lifecycle Transition     | Effect                                                               |
+| -------------- | ------------------------ | -------------------------------------------------------------------- |
+| -              | `configure`              | Create subscriptions (start buffering), create publishers (disabled) |
+| `connect()`    | `activate`               | Enable publishers, start watchdog                                    |
+| `disconnect()` | `deactivate` → `cleanup` | Safety action, disable publishers, destroy resources                 |
 
 ### Policy Inference
 
@@ -231,15 +286,15 @@ We provide [rosetta_ws](https://github.com/iblnkn/rosetta_ws), a devcontainer wo
 
 The contract defines the translation between ROS 2 topics and the keys LeRobot expects.
 
-| ROS2 Side | | LeRobot Side |
-|-----------|---|-------------|
-| `/front_camera/image_raw/compressed` | &rarr; | `observation.images.front` |
-| `/follower_arm/joint_states` (position fields) | &rarr; | `observation.state` |
-| `/imu/data` (orientation, angular_velocity) | &rarr; | `observation.state.imu` |
-| `/leader_arm/joint_states` (position fields) | &larr; | `action` |
-| `/base_controller/cmd_vel` (linear, angular) | &larr; | `action.base` |
-| `/task_prompt` (String) | &rarr; | `task` |
-| `/reward_signal` (Float64) | &rarr; | `next.reward` |
+| ROS2 Side                                      |        | LeRobot Side               |
+| ---------------------------------------------- | ------ | -------------------------- |
+| `/front_camera/image_raw/compressed`           | &rarr; | `observation.images.front` |
+| `/follower_arm/joint_states` (position fields) | &rarr; | `observation.state`        |
+| `/imu/data` (orientation, angular_velocity)    | &rarr; | `observation.state.imu`    |
+| `/leader_arm/joint_states` (position fields)   | &larr; | `action`                   |
+| `/base_controller/cmd_vel` (linear, angular)   | &larr; | `action.base`              |
+| `/task_prompt` (String)                        | &rarr; | `task`                     |
+| `/reward_signal` (Float64)                     | &rarr; | `next.reward`              |
 
 On the ROS2 side, data lives in typed messages on named topics with rich structure (headers, arrays, nested fields). On the LeRobot side, data lives in flat dictionaries with dot-separated string keys and numpy/tensor values. The contract maps one to the other, handling type conversion, field extraction, timestamp alignment, and resampling.
 
@@ -305,17 +360,17 @@ ros2 action send_goal /episode_recorder/record_episode \
 
 **Parameters** (all available as launch arguments):
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `contract_path` | `contracts/so_101.yaml` | Path to contract YAML |
-| `bag_base_dir` | `/workspaces/rosetta_ws/datasets/bags` | Directory for rosbag output |
-| `storage_id` | `mcap` | Rosbag format: `mcap` (recommended) or `sqlite3` |
-| `default_max_duration` | `300.0` | Max episode duration in seconds |
-| `feedback_rate_hz` | `2.0` | Recording feedback publish rate |
-| `default_qos_depth` | `10` | QoS queue depth for subscriptions |
-| `log_level` | `info` | Logging level: `debug`, `info`, `warn`, `error` |
-| `configure` | `true` | Auto-configure on startup |
-| `activate` | `true` | Auto-activate on startup |
+| Parameter              | Default                                | Description                                      |
+| ---------------------- | -------------------------------------- | ------------------------------------------------ |
+| `contract_path`        | `contracts/so_101.yaml`                | Path to contract YAML                            |
+| `bag_base_dir`         | `/workspaces/rosetta_ws/datasets/bags` | Directory for rosbag output                      |
+| `storage_id`           | `mcap`                                 | Rosbag format: `mcap` (recommended) or `sqlite3` |
+| `default_max_duration` | `300.0`                                | Max episode duration in seconds                  |
+| `feedback_rate_hz`     | `2.0`                                  | Recording feedback publish rate                  |
+| `default_qos_depth`    | `10`                                   | QoS queue depth for subscriptions                |
+| `log_level`            | `info`                                 | Logging level: `debug`, `info`, `warn`, `error`  |
+| `configure`            | `true`                                 | Auto-configure on startup                        |
+| `activate`             | `true`                                 | Auto-activate on startup                         |
 
 **Examples:**
 
@@ -371,11 +426,11 @@ python -m rosetta.port_bags \
 
 **Rosetta-specific additions:**
 
-| Argument | Description |
-|----------|-------------|
+| Argument     | Description                                                                            |
+| ------------ | -------------------------------------------------------------------------------------- |
 | `--contract` | **(Required)** Rosetta contract YAML that defines ROS2 topic → LeRobot feature mapping |
-| `--root` | Override output directory (LeRobot defaults to `~/.cache/huggingface/lerobot`) |
-| `--vcodec` | Video codec selection (not in base LeRobot porters) |
+| `--root`     | Override output directory (LeRobot defaults to `~/.cache/huggingface/lerobot`)         |
+| `--vcodec`   | Video codec selection (not in base LeRobot porters)                                    |
 
 ### Basic Usage
 
@@ -456,15 +511,15 @@ huggingface-cli upload my-org/my-policy \
 
 ### Supported Policies
 
-| Policy | Type | Best For |
-|--------|------|----------|
-| [**ACT**](https://huggingface.co/docs/lerobot/act) | Behavior Cloning | General manipulation, fast training (recommended for beginners) |
-| [**SmolVLA**](https://huggingface.co/docs/lerobot/smolvla) | VLA | Efficient VLA, good for resource-constrained setups |
-| [**Pi0**](https://huggingface.co/docs/lerobot/pi0) / [**Pi0Fast**](https://huggingface.co/docs/lerobot/pi0fast) | VLA | Physical Intelligence foundation models |
-| [**Pi0.5**](https://huggingface.co/docs/lerobot/pi05) | VLA | Open-world generalization |
-| [**NVIDIA GR00T N1.5**](https://huggingface.co/docs/lerobot/groot) | VLA | Humanoid and general robotics |
-| [**Wall-X**](https://huggingface.co/docs/lerobot/walloss) | VLA | Qwen 2.5-VL backbone, multi-embodiment |
-| [**X-VLA**](https://huggingface.co/docs/lerobot/xvla) | VLA | Cross-embodiment with soft prompts |
+| Policy                                                                                                          | Type             | Best For                                                        |
+| --------------------------------------------------------------------------------------------------------------- | ---------------- | --------------------------------------------------------------- |
+| [**ACT**](https://huggingface.co/docs/lerobot/act)                                                              | Behavior Cloning | General manipulation, fast training (recommended for beginners) |
+| [**SmolVLA**](https://huggingface.co/docs/lerobot/smolvla)                                                      | VLA              | Efficient VLA, good for resource-constrained setups             |
+| [**Pi0**](https://huggingface.co/docs/lerobot/pi0) / [**Pi0Fast**](https://huggingface.co/docs/lerobot/pi0fast) | VLA              | Physical Intelligence foundation models                         |
+| [**Pi0.5**](https://huggingface.co/docs/lerobot/pi05)                                                           | VLA              | Open-world generalization                                       |
+| [**NVIDIA GR00T N1.5**](https://huggingface.co/docs/lerobot/groot)                                              | VLA              | Humanoid and general robotics                                   |
+| [**Wall-X**](https://huggingface.co/docs/lerobot/walloss)                                                       | VLA              | Qwen 2.5-VL backbone, multi-embodiment                          |
+| [**X-VLA**](https://huggingface.co/docs/lerobot/xvla)                                                           | VLA              | Cross-embodiment with soft prompts                              |
 
 ## Deploying Policies
 
@@ -487,22 +542,22 @@ ros2 action send_goal /rosetta_client/run_policy \
 
 **Parameters** (all available as launch arguments):
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `contract_path` | `contracts/so_101.yaml` | Path to contract YAML |
-| `pretrained_name_or_path` | *(see params file)* | HuggingFace model ID or local path |
-| `server_address` | `127.0.0.1:8080` | Policy server address |
-| `policy_type` | `act` | Policy type: `act`, `smolvla`, `diffusion`, `pi0`, `pi05`, etc. |
-| `policy_device` | `cuda` | Inference device: `cuda`, `cpu`, `mps`, or `cuda:0` |
-| `actions_per_chunk` | `30` | Actions per inference chunk |
-| `chunk_size_threshold` | `0.95` | When to request new chunk (0.0-1.0) |
-| `aggregate_fn_name` | `weighted_average` | Chunk aggregation: `weighted_average`, `latest_only`, `average`, `conservative` |
-| `feedback_rate_hz` | `2.0` | Execution feedback publish rate |
-| `launch_local_server` | `true` | Auto-start policy server subprocess |
-| `obs_similarity_atol` | `-1.0` | Observation filtering tolerance (-1.0 to disable)* |
-| `log_level` | `info` | Logging level: `debug`, `info`, `warn`, `error` |
-| `configure` | `true` | Auto-configure on startup |
-| `activate` | `true` | Auto-activate on startup |
+| Parameter                 | Default                 | Description                                                                     |
+| ------------------------- | ----------------------- | ------------------------------------------------------------------------------- |
+| `contract_path`           | `contracts/so_101.yaml` | Path to contract YAML                                                           |
+| `pretrained_name_or_path` | *(see params file)*     | HuggingFace model ID or local path                                              |
+| `server_address`          | `127.0.0.1:8080`        | Policy server address                                                           |
+| `policy_type`             | `act`                   | Policy type: `act`, `smolvla`, `diffusion`, `pi0`, `pi05`, etc.                 |
+| `policy_device`           | `cuda`                  | Inference device: `cuda`, `cpu`, `mps`, or `cuda:0`                             |
+| `actions_per_chunk`       | `30`                    | Actions per inference chunk                                                     |
+| `chunk_size_threshold`    | `0.95`                  | When to request new chunk (0.0-1.0)                                             |
+| `aggregate_fn_name`       | `weighted_average`      | Chunk aggregation: `weighted_average`, `latest_only`, `average`, `conservative` |
+| `feedback_rate_hz`        | `2.0`                   | Execution feedback publish rate                                                 |
+| `launch_local_server`     | `true`                  | Auto-start policy server subprocess                                             |
+| `obs_similarity_atol`     | `-1.0`                  | Observation filtering tolerance (-1.0 to disable)*                              |
+| `log_level`               | `info`                  | Logging level: `debug`, `info`, `warn`, `error`                                 |
+| `configure`               | `true`                  | Auto-configure on startup                                                       |
+| `activate`                | `true`                  | Auto-activate on startup                                                        |
 
 *\*`obs_similarity_atol`: The policy server filters observations that are "too similar" (L2 norm of state difference < threshold). The default threshold (1.0) assumes joint states change significantly between frames. Many robots have smaller movements, causing most observations to be skipped. Set to `-1.0` to disable filtering.*
 
@@ -530,14 +585,14 @@ See [Imitation Learning on Real Robots](https://huggingface.co/docs/lerobot/il_r
 
 A contract is a YAML file that maps ROS2 topics to LeRobot's observation/action interface. The contract currently maps to the full LeRobot `EnvTransition` interface:
 
-| Contract Section | EnvTransition Slot | Status |
-|-----------------|-------------------|--------|
-| `observations` | `observation.*` | Supported |
-| `actions` | `action*` | Supported |
-| `tasks` | `complementary_data.task` | Supported |
-| `rewards` | `next.reward` | Supported |
-| `signals` | `next.done`, `next.truncated` | Supported |
-| `complementary_data` | `complementary_data.*` | Supported |
+| Contract Section     | EnvTransition Slot            | Status    |
+| -------------------- | ----------------------------- | --------- |
+| `observations`       | `observation.*`               | Supported |
+| `actions`            | `action*`                     | Supported |
+| `tasks`              | `complementary_data.task`     | Supported |
+| `rewards`            | `next.reward`                 | Supported |
+| `signals`            | `next.done`, `next.truncated` | Supported |
+| `complementary_data` | `complementary_data.*`        | Supported |
 
 Not every section needs to be filled for every robot. A minimal contract only needs `observations` and `actions`. To see which keys are required or accepted by different policies, see [Policy Feature Compatibility](#policy-feature-compatibility).
 
@@ -688,28 +743,28 @@ names: [twist.twist.linear.x, pose.pose.position.z]
 
 ### Alignment Strategies
 
-| Strategy | Behavior |
-|----------|----------|
-| `hold` | Use most recent message, no matter how old (default) |
-| `asof` | Use most recent message only if within `tol_ms` tolerance window, otherwise return nothing (zero-filled). Useful for rejecting stale data |
-| `drop` | Use most recent message only if it arrived within the current step/frame window |
+| Strategy | Behavior                                                                                                                                  |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `hold`   | Use most recent message, no matter how old (default)                                                                                      |
+| `asof`   | Use most recent message only if within `tol_ms` tolerance window, otherwise return nothing (zero-filled). Useful for rejecting stale data |
+| `drop`   | Use most recent message only if it arrived within the current step/frame window                                                           |
 
 ### Supported Message Types
 
-| Type | Extracted Fields |
-|------|------------------|
-| `sensor_msgs/msg/JointState` | position, velocity, effort by joint name |
-| `sensor_msgs/msg/Image` | RGB uint8 array |
-| `sensor_msgs/msg/CompressedImage` | Decoded to RGB uint8 |
-| `geometry_msgs/msg/Twist` | linear.xyz, angular.xyz |
-| `nav_msgs/msg/Odometry` | pose, twist fields |
-| `sensor_msgs/msg/Joy` | axes, buttons arrays |
-| `sensor_msgs/msg/Imu` | orientation, angular_velocity, linear_acceleration |
-| `std_msgs/msg/Float32` | Scalar float32 |
-| `std_msgs/msg/Float64` | Scalar float64 |
-| `std_msgs/msg/String` | Text string |
-| `std_msgs/msg/Bool` | Boolean |
-| `std_msgs/msg/Float64MultiArray` | Vector float64 |
+| Type                              | Extracted Fields                                   |
+| --------------------------------- | -------------------------------------------------- |
+| `sensor_msgs/msg/JointState`      | position, velocity, effort by joint name           |
+| `sensor_msgs/msg/Image`           | RGB uint8 array                                    |
+| `sensor_msgs/msg/CompressedImage` | Decoded to RGB uint8                               |
+| `geometry_msgs/msg/Twist`         | linear.xyz, angular.xyz                            |
+| `nav_msgs/msg/Odometry`           | pose, twist fields                                 |
+| `sensor_msgs/msg/Joy`             | axes, buttons arrays                               |
+| `sensor_msgs/msg/Imu`             | orientation, angular_velocity, linear_acceleration |
+| `std_msgs/msg/Float32`            | Scalar float32                                     |
+| `std_msgs/msg/Float64`            | Scalar float64                                     |
+| `std_msgs/msg/String`             | Text string                                        |
+| `std_msgs/msg/Bool`               | Boolean                                            |
+| `std_msgs/msg/Float64MultiArray`  | Vector float64                                     |
 
 The dtype is auto-detected from the message type. You can override it with the `dtype` field in the contract, or use a custom decoder for non-standard types.
 
@@ -797,11 +852,11 @@ def my_encoder(values, spec, stamp_ns=None):
 
 #### When Each Is Used
 
-| Field | Used By | Purpose |
-|-------|---------|---------|
-| `decoder` on observations | Runtime, `port_bags.py` | Decode incoming sensor data |
-| `decoder` on actions | `port_bags.py` | Read recorded actions from bags |
-| `encoder` on actions | Runtime | Publish actions to ROS topics |
+| Field                     | Used By                 | Purpose                         |
+| ------------------------- | ----------------------- | ------------------------------- |
+| `decoder` on observations | Runtime, `port_bags.py` | Decode incoming sensor data     |
+| `decoder` on actions      | `port_bags.py`          | Read recorded actions from bags |
+| `encoder` on actions      | Runtime                 | Publish actions to ROS topics   |
 
 ---
 
@@ -839,14 +894,14 @@ There is no parent-child relationship between these keys. `observation.state` an
 
 While keys are free-form strings, LeRobot policies use **prefix matching** to classify them into feature types. This classification determines how policies process each feature:
 
-| Prefix | FeatureType | How policies use it |
-|--------|-------------|---------------------|
-| `observation.images.*` or `observation.image` | `VISUAL` | Fed through vision encoder |
-| `observation.environment_state` (exact) | `ENV` | Separate encoder projection (privileged sim state) |
-| `observation.*` (everything else under observation) | `STATE` | Robot state encoder |
-| `observation.language.*` | `LANGUAGE` | Tokenized text for VLA forward pass |
-| `action*` | `ACTION` | Policy output / training target |
-| `next.reward` | `REWARD` | RL reward signal |
+| Prefix                                              | FeatureType | How policies use it                                |
+| --------------------------------------------------- | ----------- | -------------------------------------------------- |
+| `observation.images.*` or `observation.image`       | `VISUAL`    | Fed through vision encoder                         |
+| `observation.environment_state` (exact)             | `ENV`       | Separate encoder projection (privileged sim state) |
+| `observation.*` (everything else under observation) | `STATE`     | Robot state encoder                                |
+| `observation.language.*`                            | `LANGUAGE`  | Tokenized text for VLA forward pass                |
+| `action*`                                           | `ACTION`    | Policy output / training target                    |
+| `next.reward`                                       | `REWARD`    | RL reward signal                                   |
 
 This means `observation.state.imu`, `observation.state.joint_position`, and `observation.state` are all classified as `STATE`. Similarly, `action.arm` and `action.gripper` are both `ACTION`.
 
@@ -930,11 +985,11 @@ Most built-in policies expect a single `action` key. If you split into sub-keys,
 
 These serve different purposes and can coexist:
 
-| Concept | Key(s) | Type | Purpose |
-|---------|--------|------|---------|
-| **Task string** | `task` | `str` | Human-readable label: `"pick up the red block"` |
-| **Language tokens** | `observation.language.tokens` | `Tensor (int)` | Tokenized text for VLA forward pass |
-| **Language mask** | `observation.language.attention_mask` | `Tensor (bool)` | Attention mask for tokenized text |
+| Concept             | Key(s)                                | Type            | Purpose                                         |
+| ------------------- | ------------------------------------- | --------------- | ----------------------------------------------- |
+| **Task string**     | `task`                                | `str`           | Human-readable label: `"pick up the red block"` |
+| **Language tokens** | `observation.language.tokens`         | `Tensor (int)`  | Tokenized text for VLA forward pass             |
+| **Language mask**   | `observation.language.attention_mask` | `Tensor (bool)` | Attention mask for tokenized text               |
 
 The **flow** between them: the dataset stores a `task_index` (int) per frame, which resolves to a `task` string via `meta/tasks.parquet`. How that string reaches the policy depends on the policy:
 
@@ -985,29 +1040,29 @@ Note: `meta/info.json` in the dataset directory is unrelated; it stores the data
 
 Each feature key maps to a specific data type. LeRobot datasets support:
 
-| Data Type | LeRobot dtype | Shape | Description | Example Keys |
-|-----------|--------------|-------|-------------|-------------|
-| **Float vector** | `float32` / `float64` | `(N,)` | Continuous values: joints, poses, velocities | `observation.state`, `action` |
-| **Image** | `video` | `(H, W, 3)` | RGB uint8 frames, stored as MP4 | `observation.images.*` |
-| **String** | `string` | `(1,)` | Text labels, prompts | `task`, `language_instruction` |
-| **Boolean** | `bool` | `(1,)` or `(N,)` | Binary flags | `next.done`, `action_is_pad` |
-| **Integer** | `int32` / `int64` | `(1,)` or `(N,)` | Discrete values, indices | `task_index`, `episode_index` |
+| Data Type        | LeRobot dtype         | Shape            | Description                                  | Example Keys                   |
+| ---------------- | --------------------- | ---------------- | -------------------------------------------- | ------------------------------ |
+| **Float vector** | `float32` / `float64` | `(N,)`           | Continuous values: joints, poses, velocities | `observation.state`, `action`  |
+| **Image**        | `video`               | `(H, W, 3)`      | RGB uint8 frames, stored as MP4              | `observation.images.*`         |
+| **String**       | `string`              | `(1,)`           | Text labels, prompts                         | `task`, `language_instruction` |
+| **Boolean**      | `bool`                | `(1,)` or `(N,)` | Binary flags                                 | `next.done`, `action_is_pad`   |
+| **Integer**      | `int32` / `int64`     | `(1,)` or `(N,)` | Discrete values, indices                     | `task_index`, `episode_index`  |
 
 In the Rosetta contract, dtype is usually **auto-detected** from the ROS2 message type:
 
-| ROS2 Message Type | Auto dtype | Output |
-|-------------------|-----------|--------|
-| `sensor_msgs/msg/JointState` | `float64` | Selected position/velocity/effort values |
-| `sensor_msgs/msg/CompressedImage` | `video` | RGB uint8 `(H, W, 3)` |
-| `sensor_msgs/msg/Image` | `video` | RGB uint8 `(H, W, 3)` |
-| `geometry_msgs/msg/Twist` | `float64` | Selected linear/angular components |
-| `nav_msgs/msg/Odometry` | `float64` | Selected pose/twist fields |
-| `sensor_msgs/msg/Imu` | `float64` | Orientation, angular vel, linear accel |
-| `std_msgs/msg/Float32` | `float32` | Scalar `(1,)` |
-| `std_msgs/msg/Float64` | `float64` | Scalar `(1,)` |
-| `std_msgs/msg/String` | `string` | Text `(1,)` |
-| `std_msgs/msg/Bool` | `bool` | Boolean `(1,)` |
-| `std_msgs/msg/Float64MultiArray` | `float64` | Vector `(N,)` |
+| ROS2 Message Type                 | Auto dtype | Output                                   |
+| --------------------------------- | ---------- | ---------------------------------------- |
+| `sensor_msgs/msg/JointState`      | `float64`  | Selected position/velocity/effort values |
+| `sensor_msgs/msg/CompressedImage` | `video`    | RGB uint8 `(H, W, 3)`                    |
+| `sensor_msgs/msg/Image`           | `video`    | RGB uint8 `(H, W, 3)`                    |
+| `geometry_msgs/msg/Twist`         | `float64`  | Selected linear/angular components       |
+| `nav_msgs/msg/Odometry`           | `float64`  | Selected pose/twist fields               |
+| `sensor_msgs/msg/Imu`             | `float64`  | Orientation, angular vel, linear accel   |
+| `std_msgs/msg/Float32`            | `float32`  | Scalar `(1,)`                            |
+| `std_msgs/msg/Float64`            | `float64`  | Scalar `(1,)`                            |
+| `std_msgs/msg/String`             | `string`   | Text `(1,)`                              |
+| `std_msgs/msg/Bool`               | `bool`     | Boolean `(1,)`                           |
+| `std_msgs/msg/Float64MultiArray`  | `float64`  | Vector `(N,)`                            |
 
 You can override the auto-detected dtype with the `dtype` field in the contract, or use a [custom decoder](#custom-encodersdecoders-experimental) for non-standard message types.
 
@@ -1015,22 +1070,22 @@ You can override the auto-detected dtype with the `dtype` field in the contract,
 
 Each LeRobot policy implements its own `validate_features()` and accesses batch keys differently. There is no single enforced schema; what keys a policy accepts depends on the policy. This table summarizes the actual requirements based on the modeling code in `lerobot/src/lerobot/policies/`:
 
-| Feature | ACT | SmolVLA | Pi0 | Pi0-Fast | Pi0.5 | GR00T N1.5 | Wall-X | X-VLA |
-|---------|:---:|:-------:|:---:|:--------:|:-----:|:----------:|:------:|:-----:|
-| **Type** | BC | VLA | VLA | VLA | VLA | VLA | VLA | VLA |
-| **`observation.state`** | optional | **required** | optional | - | - | optional | **required** | optional |
-| **`observation.environment_state`** | optional | - | - | - | - | - | - | - |
-| **`observation.images.*`** | multi | multi | multi | multi | multi | multi | multi | multi |
-| **`task` string** | - | **required** | **required** | **required** | **required** | **required** | **required** | **required** |
-| **`action`** | **required** | **required** | **required** | **required** | **required** | **required** | **required** | **required** |
-| **VLM backbone (params)** | - | SmolVLM2 (0.5B) | PaliGemma (3B / 0.7B) | PaliGemma (3B) | PaliGemma (3B / 0.7B) | Eagle 2.5 (3B) | Qwen 2.5-VL (7B) | Florence2 (0.7B / 0.2B) |
-| **RTC support** | - | yes | yes | yes | yes | - | - | - |
-| **Max state dim** | any | 32 | 32 | 32 | - | 64 | 20 | 32 |
-| **Max action dim** | any | 32 | 32 | 32 | 32 | 32 | 20 | 20 |
-| **Image size** | any | 512×512 | 224×224 | 224×224 | 224×224 | 224×224 | any | any |
-| **Max language tokens** | - | 48 | 48 | 200 | 48 | 4096 | 768 | 64 |
-| **Chunk size (default) [max]** | (100) | (50) | (50) | (50) | (50) | (50) [1024] | (32) | (32) [512] |
-| **Async inference** | yes | yes | yes | - | yes | yes | - | - |
+| Feature                             |     ACT      |     SmolVLA     |          Pi0          |    Pi0-Fast    |         Pi0.5         |   GR00T N1.5   |      Wall-X      |          X-VLA          |
+| ----------------------------------- | :----------: | :-------------: | :-------------------: | :------------: | :-------------------: | :------------: | :--------------: | :---------------------: |
+| **Type**                            |      BC      |       VLA       |          VLA          |      VLA       |          VLA          |      VLA       |       VLA        |           VLA           |
+| **`observation.state`**             |   optional   |  **required**   |       optional        |       -        |           -           |    optional    |   **required**   |        optional         |
+| **`observation.environment_state`** |   optional   |        -        |           -           |       -        |           -           |       -        |        -         |            -            |
+| **`observation.images.*`**          |    multi     |      multi      |         multi         |     multi      |         multi         |     multi      |      multi       |          multi          |
+| **`task` string**                   |      -       |  **required**   |     **required**      |  **required**  |     **required**      |  **required**  |   **required**   |      **required**       |
+| **`action`**                        | **required** |  **required**   |     **required**      |  **required**  |     **required**      |  **required**  |   **required**   |      **required**       |
+| **VLM backbone (params)**           |      -       | SmolVLM2 (0.5B) | PaliGemma (3B / 0.7B) | PaliGemma (3B) | PaliGemma (3B / 0.7B) | Eagle 2.5 (3B) | Qwen 2.5-VL (7B) | Florence2 (0.7B / 0.2B) |
+| **RTC support**                     |      -       |       yes       |          yes          |      yes       |          yes          |       -        |        -         |            -            |
+| **Max state dim**                   |     any      |       32        |          32           |       32       |           -           |       64       |        20        |           32            |
+| **Max action dim**                  |     any      |       32        |          32           |       32       |          32           |       32       |        20        |           20            |
+| **Image size**                      |     any      |     512×512     |        224×224        |    224×224     |        224×224        |    224×224     |       any        |           any           |
+| **Max language tokens**             |      -       |       48        |          48           |      200       |          48           |      4096      |       768        |           64            |
+| **Chunk size (default) [max]**      |    (100)     |      (50)       |         (50)          |      (50)      |         (50)          |  (50) [1024]   |       (32)       |       (32) [512]        |
+| **Async inference**                 |     yes      |       yes       |          yes          |       -        |          yes          |      yes       |        -         |            -            |
 
 
 
