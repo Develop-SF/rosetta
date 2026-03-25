@@ -11,17 +11,29 @@
 
 ## Table of Contents
 
-- [Recent Changes](#recent-changes)
+- [Table of Contents](#table-of-contents)
 - [Quick Start](#quick-start)
+  - [Inference on Emily in Isaac Sim](#inference-on-emily-in-isaac-sim)
 - [Core Concepts](#core-concepts)
   - [What is LeRobot?](#what-is-lerobot)
   - [What is Rosetta?](#what-is-rosetta)
 - [Architecture](#architecture)
+  - [LeRobot Plugin Architecture](#lerobot-plugin-architecture)
+  - [ROS2 Lifecycle Integration](#ros2-lifecycle-integration)
+  - [Policy Inference](#policy-inference)
+  - [rosetta\_ws Workspace](#rosetta_ws-workspace)
 - [The Contract](#the-contract)
 - [Recording Episodes](#recording-episodes)
   - [Why Record to Bag Files?](#why-record-to-bag-files)
 - [Converting Bags to Datasets](#converting-bags-to-datasets)
+  - [Relationship to LeRobot](#relationship-to-lerobot)
+  - [Basic Usage](#basic-usage)
 - [Training a Policy](#training-a-policy)
+  - [Quick Start: ACT](#quick-start-act)
+  - [Fine-tuning VLA Models](#fine-tuning-vla-models)
+  - [Multi-GPU Training](#multi-gpu-training)
+  - [Resume Training](#resume-training)
+  - [Upload to HuggingFace Hub](#upload-to-huggingface-hub)
   - [Supported Policies](#supported-policies)
 - [Deploying Policies](#deploying-policies)
 - [Contract Reference](#contract-reference)
@@ -35,11 +47,24 @@
   - [Alignment Strategies](#alignment-strategies)
   - [Supported Message Types](#supported-message-types)
   - [Custom Encoders/Decoders (Experimental)](#custom-encodersdecoders-experimental)
+    - [Method 1: Specify in Contract (Recommended)](#method-1-specify-in-contract-recommended)
+    - [Method 2: Global Registration](#method-2-global-registration)
+    - [Function Signatures](#function-signatures)
+    - [When Each Is Used](#when-each-is-used)
 - [LeRobot Data Model Reference](#lerobot-data-model-reference)
   - [Key System](#key-system)
+    - [How LeRobot classifies keys](#how-lerobot-classifies-keys)
+    - [Convention vs. compatibility](#convention-vs-compatibility)
   - [EnvTransition](#envtransition)
+    - [Observation (`observation.*`)](#observation-observation)
+    - [Action (`action*`)](#action-action)
+    - [Task and Language](#task-and-language)
+    - [Reward and Episode Signals](#reward-and-episode-signals)
+    - [Complementary Data](#complementary-data)
+    - [Info](#info)
   - [Data Types](#data-types)
   - [Policy Feature Compatibility](#policy-feature-compatibility)
+    - [What this means for your contract](#what-this-means-for-your-contract)
 - [License](#license)
 
 <a id="recent-changes"></a>
@@ -148,6 +173,28 @@ ros2 launch rosetta rosetta_client_launch.py \
 ros2 action send_goal /rosetta_client/run_policy \
     rosetta_interfaces/action/RunPolicy "{prompt: 'pick up red block'}"
 ```
+
+### Inference on Emily in Isaac Sim
+
+> DO NOT launch the sns_autonomy!
+
+Launch the Rosetta client with the appropriate contract and pretrained policy checkpoint:
+* ACT
+  ```
+  ros2 launch rosetta rosetta_client_launch.py     contract_path:=/root/ws_rl/src/sns_robot_learning/src/sns_robot_learning/rosetta_contracts/record/emily_isaac_infer.yaml     pretrained_name_or_path:=src/policies/emily/pickplace_sim_act/checkpoints/last/pretrained_model policy_type:=act
+  ```
+* Diffusion Policy
+  ```
+  ros2 launch rosetta rosetta_client_launch.py \
+    contract_path:=/root/ws_rl/src/sns_robot_learning/src/sns_robot_learning/rosetta_contracts/record/emily_isaac_infer.yaml \
+    pretrained_name_or_path:=src/policies/emily/pickplace_sim_dp/checkpoints/last/pretrained_model \
+    policy_type:=diffusion
+  ```
+* Start inference:
+  ```
+  ros2 action send_goal /run_policy     rosetta_interfaces/action/RunPolicy "{prompt: ''}"
+  ```
+
 
 ---
 
