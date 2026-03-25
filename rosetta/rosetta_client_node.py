@@ -368,7 +368,10 @@ class RosettaClientNode(LifecycleNode):
         if self.get_parameter("is_classifier").value:
             module = "rosetta.common.classifier_server"
         else:
-            module = "lerobot.async_inference.policy_server"
+            # Rosetta wrapper patches DiffusionPolicy.predict_action_chunk to
+            # handle observation queue population + image stacking internally,
+            # then delegates to the original lerobot serve().
+            module = "rosetta.common.policy_server"
 
         self.get_logger().info(f"Launching {module} on {host}:{port}...")
 
