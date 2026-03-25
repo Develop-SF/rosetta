@@ -477,6 +477,36 @@ def _dec_multidof_command(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
 
 
 # =============================================================================
+# GripperCommand Decoder
+# =============================================================================
+
+
+@register_decoder("control_msgs/msg/GripperCommand", dtype="float64")
+def _dec_gripper_command(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode control_msgs/GripperCommand.
+
+    With selector names like ['position', 'max_effort']:
+      - Extracts specified fields by name
+    Without names:
+      - Returns [position, max_effort]
+    """
+    if not spec.names:
+        return np.array([msg.position, msg.max_effort], dtype=np.float64)
+
+    _VALID_FIELDS = {"position", "max_effort"}
+    out = []
+    for name in spec.names:
+        if name not in _VALID_FIELDS:
+            raise ValueError(
+                f"Unknown GripperCommand field '{name}'. "
+                f"Valid fields: position, max_effort"
+            )
+        out.append(float(getattr(msg, name)))
+
+    return np.asarray(out, dtype=np.float64)
+
+
+# =============================================================================
 # JointTrajectory Decoder
 # =============================================================================
 
