@@ -46,6 +46,9 @@ from lerobot.processor import RobotProcessorPipeline
 from lerobot.processor.converters import (
     observation_to_transition,
     transition_to_observation,
+    robot_action_to_transition,
+    transition_to_robot_action,
+    create_transition,
 )
 from rosetta_interfaces.action import RunPolicy
 
@@ -53,7 +56,8 @@ from lerobot_robot_rosetta import RosettaConfig
 from lerobot_robot_rosetta.rosetta import _TopicBridge
 
 from .common.ros2_utils import is_jazzy_or_newer
-from .common import processors as _processors  # noqa: F401
+from .common import obs_processors as _obs_processors  # noqa: F401
+from .common import relative_action_processor as _rel_act  # noqa: F401
 
 SERVER_STARTUP_TIMEOUT_SEC = 30.0
 SERVER_STARTUP_POLL_SEC = 0.5
@@ -62,24 +66,58 @@ THREAD_JOIN_TIMEOUT_SEC = 2.0
 FEEDBACK_THREAD_JOIN_TIMEOUT_SEC = 1.0
 
 
-class _ObsProcessingRobotWrapper:
-    """Wraps a robot to apply an observation processor on get_observation().
+class _ProcessingRobotWrapper:
+    """Wraps a robot to apply observation and/or action processors.
 
-    This avoids modifying RobotClient: the processor is injected at the robot
-    layer so RobotClient.control_loop_observation() receives already-processed
-    observations without any knowledge of the processor.
+    This avoids modifying RobotClient: processors are injected at the robot
+    layer so RobotClient sees already-processed observations and the robot
+    receives post-processed actions, all without any knowledge of the
+    processors.
+
+    Args:
+        robot: The underlying robot instance to wrap.
+        obs_processor: Optional processor applied to observations
+            returned by ``get_observation()``.
+        action_processor: Optional processor applied to actions
+            passed to ``send_action()``.
     """
 
-    def __init__(self, robot, processor):
+    def __init__(
+        self,
+        robot,
+        obs_processor: RobotProcessorPipeline | None = None,
+        action_processor: RobotProcessorPipeline | None = None,
+    ):
         self._robot = robot
-        self._processor = processor
+        self._obs_processor = obs_processor
+        self._action_processor = action_processor
+        self._last_obs: dict | None = None  # cached for action processor
+
+        # Patch the action processor's to_transition converter so steps
+        # like RelativeToAbsoluteActionStep can read the observation.
+        # The closure captures `self`, so it always reads the latest
+        # _last_obs at call time — no need to rebuild per-call.
+        if self._action_processor is not None:
+            self._action_processor.to_transition = (
+                lambda action: create_transition(
+                    action=action, observation=self._last_obs
+                )
+            )
 
     def get_observation(self):
         obs = self._robot.get_observation()
-        return self._processor(obs)
+        if self._obs_processor is not None:
+            obs = self._obs_processor(obs)
+        self._last_obs = obs  # cache so send_action can include it
+        return obs
+
+    def send_action(self, action):
+        if self._action_processor is not None:
+            action = self._action_processor(action)
+        return self._robot.send_action(action)
 
     def __getattr__(self, name):
-        # Transparently delegate everything else (action_features, send_action, etc.)
+        # Transparently delegate everything else (action_features, is_connected, etc.)
         return getattr(self._robot, name)
 
 
@@ -194,6 +232,15 @@ class RosettaClientNode(LifecycleNode):
             ParameterDescriptor(
                 description="Path to saved RobotObservationProcessor JSON config. "
                 "If empty, uses identity processor (no transform).",
+                read_only=True,
+            ),
+        )
+        self.declare_parameter(
+            "action_processor_path",
+            "",
+            ParameterDescriptor(
+                description="Path to saved RobotActionProcessor JSON config. "
+                "If empty, actions are sent to the robot unmodified.",
                 read_only=True,
             ),
         )
@@ -447,9 +494,14 @@ class RosettaClientNode(LifecycleNode):
             config = self._build_config(task)
             client = RobotClient(config)
             self._client = client
-            processor = self._build_observation_processor()
-            if processor is not None:
-                client.robot = _ObsProcessingRobotWrapper(client.robot, processor)
+            obs_proc = self._build_observation_processor()
+            act_proc = self._build_action_processor()
+            if obs_proc is not None or act_proc is not None:
+                client.robot = _ProcessingRobotWrapper(
+                    client.robot,
+                    obs_processor=obs_proc,
+                    action_processor=act_proc,
+                )
 
             if not client.start():
                 result.success = False
@@ -614,6 +666,23 @@ class RosettaClientNode(LifecycleNode):
             config_filename="robot_observation_processor.json",
             to_transition=observation_to_transition,
             to_output=transition_to_observation,
+        )
+
+    def _build_action_processor(self) -> RobotProcessorPipeline | None:
+        """Load action processor from ROS2 parameter, or return None."""
+        processor_path = self.get_parameter("action_processor_path").value
+
+        if not processor_path:
+            self.get_logger().debug("No action_processor_path set, skipping")
+            return None
+
+        self.get_logger().info(f"Loading action processor from: {processor_path}")
+
+        return RobotProcessorPipeline.from_pretrained(
+            processor_path,
+            config_filename="robot_action_processor.json",
+            to_transition=robot_action_to_transition,
+            to_output=transition_to_robot_action,
         )
 
 

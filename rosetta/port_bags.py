@@ -97,7 +97,8 @@ BAG_PROMPT_KEY = "lerobot.operator_prompt"
 # Import decoders/encoders/processors to register them
 from .common import decoders as _decoders  # noqa: F401
 from .common import encoders as _encoders  # noqa: F401
-from .common import processors as _processors  # noqa: F401
+from .common import obs_processors as _obs_processors  # noqa: F401
+from .common import relative_action_processor as _rel_act  # noqa: F401
 
 
 # ---------- Bag discovery ----------
@@ -694,6 +695,14 @@ def port_bags(
         )
 
         try:
+            # Reset stateful processors so each episode starts fresh
+            # (e.g. AbsoluteToRelativeActionStep captures the first action
+            # as the reference — without reset it would carry over).
+            if obs_processor is not None:
+                obs_processor.reset()
+            if action_processor is not None:
+                action_processor.reset()
+
             frame_count = 0
             for frame in _stream_frames_from_bag(
                 bag_dir,

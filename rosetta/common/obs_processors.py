@@ -118,6 +118,7 @@ class NumpyImageCropResizeProcessorStep(ObservationProcessorStep):
             "crop_params_dict": self.crop_params_dict,
             "resize_size": self.resize_size,
             "image_keys": self.image_keys,
+            "interpolation": self.interpolation,
         }
 
     def transform_features(
