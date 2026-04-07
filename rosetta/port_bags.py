@@ -60,7 +60,12 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.utils import get_elapsed_time_in_days_hours_minutes_seconds
 
 from .common.converters import DTYPES, decode_value, get_decoder_dtype
-from .common.contract import ObservationStreamSpec, StreamSpec, load_contract
+from .common.contract import (
+    ActionStreamSpec,
+    ObservationStreamSpec,
+    StreamSpec,
+    load_contract,
+)
 from .common.contract_utils import (
     build_feature,
     get_namespaced_names,
@@ -70,13 +75,29 @@ from .common.contract_utils import (
 )
 from .common.ros2_utils import get_message_timestamp_ns
 
+# Type alias for processors (optional import)
+try:
+    from lerobot.processor import RobotProcessorPipeline
+    from lerobot.processor.converters import (
+        observation_to_transition,
+        transition_to_observation,
+        robot_action_to_transition,
+        transition_to_robot_action,
+    )
+
+    PROCESSORS_AVAILABLE = True
+except ImportError:
+    PROCESSORS_AVAILABLE = False
+    RobotProcessorPipeline = None
+
 # Bag metadata keys
 BAG_METADATA_KEY = "rosbag2_bagfile_information"
 BAG_CUSTOM_DATA_KEY = "custom_data"
 BAG_PROMPT_KEY = "lerobot.operator_prompt"
-# Import decoders/encoders to register them
+# Import decoders/encoders/processors to register them
 from .common import decoders as _decoders  # noqa: F401
 from .common import encoders as _encoders  # noqa: F401
+from .common import processors as _processors  # noqa: F401
 
 
 # ---------- Bag discovery ----------
@@ -85,7 +106,8 @@ from .common import encoders as _encoders  # noqa: F401
 def find_bag_dirs(raw_dir: Path) -> list[Path]:
     """Find all bag directories (identified by metadata.yaml)."""
     bag_dirs = sorted(
-        p.parent for p in raw_dir.rglob("metadata.yaml")
+        p.parent
+        for p in raw_dir.rglob("metadata.yaml")
         if (p.parent / "metadata.yaml").exists()
     )
     if not bag_dirs:
@@ -211,6 +233,132 @@ DTYPE_MAP = {
 }
 
 
+def _sample_robot_dicts(
+    tick_ns: int,
+    buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Sample buffers into robot-style observation and action dicts.
+
+    Returns:
+        (robot_observation, robot_action) dicts with individual keys.
+        Keys are namespaced selector names (e.g., 'left_arm.position.joint_1').
+        Images use short keys (e.g., 'front' not 'observation.images.front').
+    """
+    robot_obs: dict[str, Any] = {}
+    robot_action: dict[str, Any] = {}
+
+    for topic, (spec, buffer) in buffers.items():
+        val = buffer.sample(tick_ns)
+
+        if isinstance(spec, ObservationStreamSpec):
+            if spec.is_image:
+                # Image: use short key
+                key = spec.key.removeprefix("observation.images.")
+                robot_obs[key] = val if val is not None else zeros_for_spec(spec)
+            elif spec.dtype == "string":
+                key = spec.key.removeprefix("observation.")
+                robot_obs[key] = str(val) if val is not None else ""
+            else:
+                # Numeric observation - individual keys
+                names = get_namespaced_names(spec)
+                if val is None:
+                    val = np.zeros(len(names) if names else 1)
+                val = np.asarray(val).flatten()
+                for i, name in enumerate(names):
+                    robot_obs[name] = float(val[i]) if i < len(val) else 0.0
+        elif isinstance(spec, ActionStreamSpec):
+            # Action spec - individual keys
+            names = get_namespaced_names(spec)
+            if val is None:
+                val = np.zeros(len(names) if names else 1)
+            val = np.asarray(val).flatten()
+            for i, name in enumerate(names):
+                robot_action[name] = float(val[i]) if i < len(val) else 0.0
+
+    return robot_obs, robot_action
+
+
+def _robot_dicts_to_frame(
+    robot_obs: dict[str, Any],
+    robot_action: dict[str, Any],
+    specs: list[StreamSpec],
+) -> dict[str, Any]:
+    """Convert robot-style dicts to LeRobot frame format.
+
+    Aggregates individual values into concatenated arrays matching feature definitions.
+
+    Note: The function will only work correctly if the processor preserves the key names
+    and data types.
+    """
+    frame: dict[str, Any] = {}
+
+    # Separate specs by type
+    obs_specs = [s for s in specs if isinstance(s, ObservationStreamSpec)]
+    action_specs = [s for s in specs if isinstance(s, ActionStreamSpec)]
+
+    # Group observation specs by key for aggregation
+    obs_by_key: dict[str, list[ObservationStreamSpec]] = {}
+    for spec in obs_specs:
+        obs_by_key.setdefault(spec.key, []).append(spec)
+
+    # Build observation features
+    for key, key_specs in obs_by_key.items():
+        first_spec = key_specs[0]
+
+        if first_spec.is_image:
+            # Image: single value
+            short_key = key.removeprefix("observation.images.")
+            img = robot_obs.get(short_key)
+            if img is not None:
+                frame[key] = np.asarray(img, dtype=np.uint8)
+            else:
+                frame[key] = zeros_for_spec(first_spec)
+        elif first_spec.dtype == "string":
+            short_key = key.removeprefix("observation.")
+            frame[key] = robot_obs.get(short_key, "")
+        elif first_spec.dtype in ("bool", "int32", "int64"):
+            # Scalar types
+            names = get_namespaced_names(first_spec)
+            np_dtype = DTYPE_MAP[first_spec.dtype]
+            if names:
+                val = robot_obs.get(names[0], 0)
+                frame[key] = np.array([val], dtype=np_dtype)
+            else:
+                frame[key] = np.zeros(1, dtype=np_dtype)
+        else:
+            # Numeric vector: concatenate all specs with this key
+            dtype_str = first_spec.dtype
+            np_dtype = DTYPE_MAP.get(dtype_str, np.float32)
+            values = []
+            for spec in key_specs:
+                for name in get_namespaced_names(spec):
+                    values.append(robot_obs.get(name, 0.0))
+            if values:
+                frame[key] = np.array(values, dtype=np_dtype)
+            else:
+                frame[key] = np.zeros(1, dtype=np_dtype)
+
+    # Group action specs by key for aggregation
+    action_by_key: dict[str, list[ActionStreamSpec]] = {}
+    for spec in action_specs:
+        action_by_key.setdefault(spec.key, []).append(spec)
+
+    # Build action features
+    for key, key_specs in action_by_key.items():
+        first_spec = key_specs[0]
+        dtype_str = get_decoder_dtype(first_spec.msg_type)
+        np_dtype = DTYPE_MAP.get(dtype_str, np.float32)
+        values = []
+        for spec in key_specs:
+            for name in get_namespaced_names(spec):
+                values.append(robot_action.get(name, 0.0))
+        frame[key] = (
+            np.array(values, dtype=np_dtype) if values else np.zeros(1, dtype=np_dtype)
+        )
+
+    return frame
+
+
 def _sample_frame(
     tick_ns: int,
     buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
@@ -237,12 +385,19 @@ def _sample_frame(
                 frame[key] = zeros_for_spec(spec)
             else:
                 frame[key] = np.asarray(val, dtype=np.uint8)
-        elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype == "string":
+        elif (
+            isinstance(first_spec, ObservationStreamSpec)
+            and first_spec.dtype == "string"
+        ):
             # String: pass through
             spec, buffer = items[0]
             val = buffer.sample(tick_ns)
             frame[key] = str(val) if val is not None else ""
-        elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype in ("bool", "int32", "int64"):
+        elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype in (
+            "bool",
+            "int32",
+            "int64",
+        ):
             # Scalar types: single value
             spec, buffer = items[0]
             val = buffer.sample(tick_ns)
@@ -261,7 +416,9 @@ def _sample_frame(
                 dtype_str = get_decoder_dtype(first_spec.msg_type)
 
             if dtype_str not in DTYPE_MAP:
-                raise ValueError(f"Unsupported dtype '{dtype_str}' for key '{key}'. Add to DTYPE_MAP.")
+                raise ValueError(
+                    f"Unsupported dtype '{dtype_str}' for key '{key}'. Add to DTYPE_MAP."
+                )
             np_dtype = DTYPE_MAP[dtype_str]
 
             values = []
@@ -278,11 +435,22 @@ def _sample_frame(
     return frame
 
 
-def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
+def _stream_frames_from_bag(
+    bag_dir: Path,
+    specs: list[StreamSpec],
+    obs_processor=None,
+    action_processor=None,
+):
     """Stream LeRobot frames from a bag file.
 
     Uses StreamBuffer for resampling (identical to live inference).
     Specs sharing the same key are aggregated into single tensors.
+
+    Args:
+        bag_dir: Path to bag directory.
+        specs: List of StreamSpecs from contract.
+        obs_processor: Optional RobotObservationProcessor to apply to observations.
+        action_processor: Optional RobotActionProcessor to apply to actions.
     """
     fps = specs[0].fps
     step_ns = int(1e9 / fps)
@@ -304,25 +472,61 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
+    # Filter reader to only yield messages for contract topics, skipping all others
+    reader.set_filter(rosbag2_py.StorageFilter(topics=list(buffers.keys())))
+
     start_ns, end_ns = _get_bag_time_bounds_ns(reader)
     n_frames = max(1, int((end_ns - start_ns) // step_ns) + 1)
 
     current_tick_idx = 0
     current_tick_ns = start_ns
+    # frames_emitted tracks how many frames have actually been yielded.
+    # is_first is set on the very first emitted frame (when all buffers are populated),
+    # not necessarily on tick index 0, to handle per-topic startup latency.
+    frames_emitted = 0
     header_warned: set[str] = set()
+
+    def _all_buffers_ready() -> bool:
+        """Return True once every topic buffer has received at least one message."""
+        return all(buf.last_ts is not None for _, buf in buffers.values())
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
 
         # Emit frames whose tick time has passed
         while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-            frame = _sample_frame(current_tick_ns, buffers)
-            frame["is_first"] = np.array([current_tick_idx == 0], dtype=bool)
+            # Hold back emission until all buffers have at least one sample
+            if not _all_buffers_ready():
+                current_tick_idx += 1
+                current_tick_ns = start_ns + current_tick_idx * step_ns
+                continue
+
+            # Use processor path if processors provided, otherwise use direct sampling
+            if obs_processor is not None or action_processor is not None:
+                # Sample into robot-style dicts
+                robot_obs, robot_action = _sample_robot_dicts(current_tick_ns, buffers)
+
+                # Apply processors
+                if obs_processor is not None:
+                    robot_obs = obs_processor(robot_obs)
+                if action_processor is not None:
+                    robot_action = action_processor(robot_action)
+
+                # Convert back to frame format
+                frame = _robot_dicts_to_frame(robot_obs, robot_action, specs)
+            else:
+                # Direct sampling (original path, no processor overhead)
+                frame = _sample_frame(current_tick_ns, buffers)
+
+            frame["is_first"] = np.array([frames_emitted == 0], dtype=bool)
             frame["is_last"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame["is_terminal"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
+            frame["is_terminal"] = np.array(
+                [current_tick_idx == n_frames - 1], dtype=bool
+            )
             frame["task"] = prompt
 
             yield frame
+            frames_emitted += 1
 
             current_tick_idx += 1
             current_tick_ns = start_ns + current_tick_idx * step_ns
@@ -340,22 +544,34 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
             ):
                 logging.warning(
                     "Header stamp unavailable for '%s' in %s, using bag receive time",
-                    spec.key, bag_dir.name,
+                    spec.key,
+                    bag_dir.name,
                 )
                 header_warned.add(spec.key)
             val = decode_value(msg, spec)
             if val is not None:
                 buffer.push(ts, val)
 
-    # Emit remaining frames
+    # Emit remaining frames after all bag messages are consumed
     while current_tick_idx < n_frames:
-        frame = _sample_frame(current_tick_ns, buffers)
-        frame["is_first"] = np.array([current_tick_idx == 0], dtype=bool)
+        # Use processor path if processors provided
+        if obs_processor is not None or action_processor is not None:
+            robot_obs, robot_action = _sample_robot_dicts(current_tick_ns, buffers)
+            if obs_processor is not None:
+                robot_obs = obs_processor(robot_obs)
+            if action_processor is not None:
+                robot_action = action_processor(robot_action)
+            frame = _robot_dicts_to_frame(robot_obs, robot_action, specs)
+        else:
+            frame = _sample_frame(current_tick_ns, buffers)
+
+        frame["is_first"] = np.array([frames_emitted == 0], dtype=bool)
         frame["is_last"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
         frame["is_terminal"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
         frame["task"] = prompt
 
         yield frame
+        frames_emitted += 1
 
         current_tick_idx += 1
         current_tick_ns = start_ns + current_tick_idx * step_ns
@@ -373,6 +589,8 @@ def port_bags(
     num_shards: int | None = None,
     shard_index: int | None = None,
     vcodec: str = "libsvtav1",
+    observation_processor_path: Path | None = None,
+    action_processor_path: Path | None = None,
 ):
     """
     Port ROS2 bags to LeRobot dataset format.
@@ -387,10 +605,44 @@ def port_bags(
         shard_index: Index of this shard (0 to num_shards-1).
         vcodec: Video codec for encoding. Options: 'libsvtav1' (default, good compression),
             'libx264'/'h264' (fast), 'hevc', 'h264_nvenc' (GPU).
+        observation_processor_path: Path to saved RobotObservationProcessor config directory.
+        action_processor_path: Path to saved RobotActionProcessor config directory.
     """
     contract = load_contract(contract_path)
     specs = list(iter_specs(contract))
     features = _build_features(specs)
+
+    # Load processors if paths provided
+    obs_processor = None
+    action_processor = None
+
+    if observation_processor_path or action_processor_path:
+        if not PROCESSORS_AVAILABLE:
+            raise ImportError(
+                "LeRobot processor module not available. "
+                "Install lerobot with processor support to use "
+                "--observation-processor or --action-processor."
+            )
+
+    if observation_processor_path:
+        logging.info(
+            "Loading observation processor from %s", observation_processor_path
+        )
+        obs_processor = RobotProcessorPipeline.from_pretrained(
+            observation_processor_path,
+            config_filename="robot_observation_processor.json",
+            to_transition=observation_to_transition,
+            to_output=transition_to_observation,
+        )
+
+    if action_processor_path:
+        logging.info("Loading action processor from %s", action_processor_path)
+        action_processor = RobotProcessorPipeline.from_pretrained(
+            action_processor_path,
+            config_filename="robot_action_processor.json",
+            to_transition=robot_action_to_transition,
+            to_output=transition_to_robot_action,
+        )
 
     all_bag_dirs = find_bag_dirs(raw_dir)
     total_bags = len(all_bag_dirs)
@@ -401,10 +653,14 @@ def port_bags(
         if shard_index is None:
             raise ValueError("shard_index required when num_shards is specified")
         if shard_index >= num_shards:
-            raise ValueError(f"shard_index ({shard_index}) >= num_shards ({num_shards})")
+            raise ValueError(
+                f"shard_index ({shard_index}) >= num_shards ({num_shards})"
+            )
 
         bag_dirs = all_bag_dirs[shard_index::num_shards]
-        logging.info("Shard %d/%d: processing %d bags", shard_index, num_shards, len(bag_dirs))
+        logging.info(
+            "Shard %d/%d: processing %d bags", shard_index, num_shards, len(bag_dirs)
+        )
     else:
         bag_dirs = all_bag_dirs
 
@@ -439,7 +695,12 @@ def port_bags(
 
         try:
             frame_count = 0
-            for frame in _stream_frames_from_bag(bag_dir, specs):
+            for frame in _stream_frames_from_bag(
+                bag_dir,
+                specs,
+                obs_processor=obs_processor,
+                action_processor=action_processor,
+            ):
                 lerobot_dataset.add_frame(frame)
                 frame_count += 1
 
@@ -483,42 +744,64 @@ def main():
     """CLI entry point."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    parser = argparse.ArgumentParser(
-        description="Port ROS2 bags to LeRobot dataset"
-    )
+    parser = argparse.ArgumentParser(description="Port ROS2 bags to LeRobot dataset")
 
     parser.add_argument(
-        "--raw-dir", type=Path, required=True,
-        help="Directory containing bag subdirectories"
+        "--raw-dir",
+        type=Path,
+        required=True,
+        help="Directory containing bag subdirectories",
     )
     parser.add_argument(
-        "--repo-id", type=str, default=None,
-        help="HuggingFace repository ID (e.g., my_org/my_dataset). Defaults to raw-dir name."
+        "--repo-id",
+        type=str,
+        default=None,
+        help="HuggingFace repository ID (e.g., my_org/my_dataset). Defaults to raw-dir name.",
     )
     parser.add_argument(
-        "--contract", type=Path, required=True,
-        help="Rosetta contract YAML path"
+        "--contract", type=Path, required=True, help="Rosetta contract YAML path"
     )
     parser.add_argument(
-        "--root", type=Path, default=None,
-        help="Parent directory for datasets. Dataset saved to root/repo-id. (default: ~/.cache/huggingface/lerobot)"
+        "--root",
+        type=Path,
+        default=None,
+        help="Parent directory for datasets. Dataset saved to root/repo-id. (default: ~/.cache/huggingface/lerobot)",
     )
     parser.add_argument(
-        "--push-to-hub", action="store_true",
-        help="Upload to HuggingFace Hub after porting"
+        "--push-to-hub",
+        action="store_true",
+        help="Upload to HuggingFace Hub after porting",
     )
     parser.add_argument(
-        "--num-shards", type=int, default=None,
-        help="Total number of shards for parallel processing"
+        "--num-shards",
+        type=int,
+        default=None,
+        help="Total number of shards for parallel processing",
     )
     parser.add_argument(
-        "--shard-index", type=int, default=None,
-        help="Index of this shard (0 to num-shards-1)"
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Index of this shard (0 to num-shards-1)",
     )
     parser.add_argument(
-        "--vcodec", type=str, default="libsvtav1",
+        "--vcodec",
+        type=str,
+        default="libsvtav1",
         choices=["libsvtav1", "libx264", "h264", "hevc", "h264_nvenc"],
-        help="Video codec for encoding (default: libsvtav1). Use libx264/h264 for faster encoding."
+        help="Video codec for encoding (default: libsvtav1). Use libx264/h264 for faster encoding.",
+    )
+    parser.add_argument(
+        "--observation-processor",
+        type=Path,
+        default=None,
+        help="Path to saved RobotObservationProcessor config directory",
+    )
+    parser.add_argument(
+        "--action-processor",
+        type=Path,
+        default=None,
+        help="Path to saved RobotActionProcessor config directory",
     )
 
     args = parser.parse_args()
@@ -535,6 +818,8 @@ def main():
             num_shards=args.num_shards,
             shard_index=args.shard_index,
             vcodec=args.vcodec,
+            observation_processor_path=args.observation_processor,
+            action_processor_path=args.action_processor,
         )
     except KeyboardInterrupt:
         logging.info("\nInterrupted by user")

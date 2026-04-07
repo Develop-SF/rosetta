@@ -409,6 +409,29 @@ def _dec_twist_stamped(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
 
 
 # =============================================================================
+# PointStamped Decoder
+# =============================================================================
+
+
+@register_decoder("geometry_msgs/msg/PointStamped", dtype="float64")
+def _dec_point_stamped(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode geometry_msgs/PointStamped.
+
+    With selector names: extracts specified dotted paths from the message
+      e.g. ['point.x', 'point.y', 'point.z'] or ['point.x']
+    Without names: returns [x, y, z]
+    """
+    if not spec.names:
+        return np.array(
+            [msg.point.x, msg.point.y, msg.point.z], dtype=np.float64
+        )
+
+    return np.asarray(
+        [float(dot_get(msg, name)) for name in spec.names], dtype=np.float64
+    )
+
+
+# =============================================================================
 # MultiDOFCommand Decoder
 # =============================================================================
 
@@ -449,6 +472,36 @@ def _dec_multidof_command(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
         if idx >= len(arr):
             raise ValueError(f"Index {idx} out of range (len={len(arr)})")
         out.append(float(arr[idx]))
+
+    return np.asarray(out, dtype=np.float64)
+
+
+# =============================================================================
+# GripperCommand Decoder
+# =============================================================================
+
+
+@register_decoder("control_msgs/msg/GripperCommand", dtype="float64")
+def _dec_gripper_command(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode control_msgs/GripperCommand.
+
+    With selector names like ['position', 'max_effort']:
+      - Extracts specified fields by name
+    Without names:
+      - Returns [position, max_effort]
+    """
+    if not spec.names:
+        return np.array([msg.position, msg.max_effort], dtype=np.float64)
+
+    _VALID_FIELDS = {"position", "max_effort"}
+    out = []
+    for name in spec.names:
+        if name not in _VALID_FIELDS:
+            raise ValueError(
+                f"Unknown GripperCommand field '{name}'. "
+                f"Valid fields: position, max_effort"
+            )
+        out.append(float(getattr(msg, name)))
 
     return np.asarray(out, dtype=np.float64)
 

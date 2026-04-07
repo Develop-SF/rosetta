@@ -128,6 +128,46 @@ def _enc_twist_stamped(
 
 
 # =============================================================================
+# PointStamped Encoder
+# =============================================================================
+
+
+@register_encoder("geometry_msgs/msg/PointStamped")
+def _enc_point_stamped(
+    action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | None = None
+) -> Any:
+    """Encode to geometry_msgs/PointStamped.
+
+    With selector.names like ['point.x', 'point.y', 'point.z']:
+      - Maps values to specified fields on the message
+    Without names:
+      - Maps action vector to [point.x, point.y, point.z] in order
+    """
+    msg_cls = get_message("geometry_msgs/msg/PointStamped")
+    msg = msg_cls()
+    _set_header_stamp(msg, stamp_ns)
+
+    arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
+
+    if not spec.names:
+        if len(arr) > 0:
+            msg.point.x = float(arr[0])
+        if len(arr) > 1:
+            msg.point.y = float(arr[1])
+        if len(arr) > 2:
+            msg.point.z = float(arr[2])
+        return msg
+
+    if len(spec.names) != len(arr):
+        raise ValueError(f"names length ({len(spec.names)}) != action length ({len(arr)})")
+
+    for i, path in enumerate(spec.names):
+        dot_set(msg, path, arr[i])
+
+    return msg
+
+
+# =============================================================================
 # Scalar Encoders
 # =============================================================================
 
@@ -318,6 +358,8 @@ def _enc_joint_trajectory(
         msg.joint_names = [f"joint_{i}" for i in range(len(arr))]
         point.positions = arr.tolist()
         msg.points = [point]
+        msg.points[0].time_from_start.sec = 0
+        msg.points[0].time_from_start.nanosec = 100_000_000  # 100ms to ensure it's treated as "immediate" but non-zero
         return msg
 
     if len(spec.names) != len(arr):
@@ -367,6 +409,8 @@ def _enc_joint_trajectory(
         setattr(point, attr, values)
 
     msg.points = [point]
+    msg.points[0].time_from_start.sec = 0
+    msg.points[0].time_from_start.nanosec = 100_000_000  # 100ms to ensure it's treated as "immediate" but non-zero
     return msg
 
 
@@ -506,5 +550,49 @@ def _enc_multidof_command(
             msg.values.append(float(arr[values_map[d]]))
         if d in values_dot_map:
             msg.values_dot.append(float(arr[values_dot_map[d]]))
+
+    return msg
+
+
+# =============================================================================
+# GripperCommand Encoder
+# =============================================================================
+
+
+@register_encoder("control_msgs/msg/GripperCommand")
+def _enc_gripper_command(
+    action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | None = None
+) -> Any:
+    """Encode to control_msgs/GripperCommand.
+
+    With selector.names like ['position', 'max_effort']:
+      - Maps values to the specified fields on the message
+    Without names:
+      - First value maps to position, second (if present) to max_effort
+    """
+    _ = stamp_ns  # Unused - message type has no header
+    msg_cls = get_message("control_msgs/msg/GripperCommand")
+    msg = msg_cls()
+
+    arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
+
+    if not spec.names:
+        if len(arr) > 0:
+            msg.position = float(arr[0])
+        if len(arr) > 1:
+            msg.max_effort = float(arr[1])
+        return msg
+
+    if len(spec.names) != len(arr):
+        raise ValueError(f"names length ({len(spec.names)}) != action length ({len(arr)})")
+
+    _VALID_FIELDS = {"position", "max_effort"}
+    for i, name in enumerate(spec.names):
+        if name not in _VALID_FIELDS:
+            raise ValueError(
+                f"Unknown GripperCommand field '{name}'. "
+                f"Valid fields: position, max_effort"
+            )
+        setattr(msg, name, float(arr[i]))
 
     return msg
