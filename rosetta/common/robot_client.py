@@ -276,7 +276,7 @@ RobotClient._ready_to_send_observation = _patched_ready_to_send_observation
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+def _patched_control_loop_observation(self, task: str, verbose: bool = True) -> RawObservation:
     try:
         # Get serialized observation bytes from the function
         start_time = time.perf_counter()
@@ -295,12 +295,22 @@ def _patched_control_loop_observation(self, task: str, verbose: bool = False) ->
 
         obs_capture_time = time.perf_counter() - start_time
 
-        # If there are no actions left in the queue, the observation must go through processing!
+        # Observation must go through processing when:
+        # 1. Queue is empty and must_go event is set (recovery path), OR
+        # 2. Queue is at or below the refill threshold (we actively need actions)
         with self.action_queue_lock:
-            observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+            queue_empty = self.action_queue.empty()
             current_queue_size = self.action_queue.qsize()
+            queue_ratio = (
+                current_queue_size / self.action_chunk_size
+                if self.action_chunk_size > 0
+                else -1.0
+            )
+            at_threshold = (not queue_empty) and (queue_ratio <= self._chunk_size_threshold)
+            observation.must_go = (self.must_go.is_set() and queue_empty) or at_threshold
 
         _ = self.send_observation(observation)
+        self._observation_pending.set()  # block further observations until actions arrive
 
         self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
         if observation.must_go:
