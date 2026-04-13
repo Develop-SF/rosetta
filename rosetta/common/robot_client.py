@@ -1,6 +1,12 @@
 """Patched LeRobot robot client for Rosetta.
 
-Monkey-patches ``RobotClient`` to register ``openarm_follower`` robot plugin.
+Monkey-patches ``RobotClient`` to:
+* Add an ``_observation_pending`` event that prevents sending observations
+  back-to-back while waiting for actions.
+* Rewrite ``_aggregate_action_queues`` to hold the lock for the entire merge and
+  filter by ``latest_action`` correctly.
+* Adjust ``_ready_to_send_observation`` to respect ``_observation_pending``.
+* Adjust ``control_loop_observation`` must-go logic for threshold-based refill.
 """
 
 import pickle  # nosec
@@ -213,7 +219,7 @@ RobotClient.receive_actions = _patched_receive_actions
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
+def _patched_control_loop_action(self, verbose: bool = True) -> dict[str, Any]:
     """Reading and performing actions in local queue"""
 
     # Lock only for queue operations
@@ -344,7 +350,7 @@ RobotClient.control_loop_observation = _patched_control_loop_observation
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop(self, task: str, verbose: bool = False):
+def _patched_control_loop(self, task: str, verbose: bool = True):
     """Combined function for executing actions and streaming observations"""
     # Wait at barrier for synchronized start
     self.start_barrier.wait()
