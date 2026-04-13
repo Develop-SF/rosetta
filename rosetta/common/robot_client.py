@@ -52,43 +52,58 @@ def _patched_aggregate_action_queues(
 ):
     """Finds the same timestep actions in the queue and aggregates them using the aggregate_fn"""
     if aggregate_fn is None:
-        # default aggregate function: take the latest action
+
         def aggregate_fn(x1, x2):
             return x2
 
-    future_action_queue = Queue()
+    with self.latest_action_lock:
+        latest_action = self.latest_action
+
+    # Hold action_queue_lock for the entire merge to prevent race with control_loop_action
     with self.action_queue_lock:
-        internal_queue = self.action_queue.queue
+        # Build a dict of existing queue actions keyed by timestep (only future ones)
+        current_action_queue = {
+            action.get_timestep(): action
+            for action in self.action_queue.queue
+            if action.get_timestep() > latest_action
+        }
 
-    current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
+        # Filter incoming actions to only future timesteps
+        incoming_by_timestep = {
+            action.get_timestep(): action
+            for action in incoming_actions
+            if action.get_timestep() > latest_action
+        }
 
-    for new_action in incoming_actions:
-        with self.latest_action_lock:
-            latest_action = self.latest_action
+        # Start with existing queue items
+        merged: dict[int, TimedAction] = dict(current_action_queue)
 
-        # New action is older than the latest action in the queue, skip it
-        if new_action.get_timestep() <= latest_action:
-            continue
+        # Merge or add incoming actions
+        for ts, new_action in incoming_by_timestep.items():
+            if ts in merged:
+                merged[ts] = TimedAction(
+                    timestamp=new_action.get_timestamp(),
+                    timestep=ts,
+                    action=aggregate_fn(merged[ts].get_action(), new_action.get_action()),
+                )
+            else:
+                merged[ts] = new_action
 
-        # If the new action's timestep is not in the current action queue, add it directly
-        elif new_action.get_timestep() not in current_action_queue:
-            future_action_queue.put(new_action)
-            continue
+        # Rebuild queue in timestep order
+        future_action_queue = Queue()
+        for ts in sorted(merged.keys()):
+            future_action_queue.put(merged[ts])
 
-        # If the new action's timestep is in the current action queue, aggregate it
-        # TODO: There is probably a way to do this with broadcasting of the two action tensors
-        future_action_queue.put(
-            TimedAction(
-                timestamp=new_action.get_timestamp(),
-                timestep=new_action.get_timestep(),
-                action=aggregate_fn(
-                    current_action_queue[new_action.get_timestep()], new_action.get_action()
-                ),
-            )
-        )
-
-    with self.action_queue_lock:
         self.action_queue = future_action_queue
+
+        self.logger.info(
+            f"Queue after merge: {future_action_queue.qsize()} actions | "
+            f"latest_action={latest_action} | "
+            f"existing={len(current_action_queue)} | "
+            f"incoming_valid={len(incoming_by_timestep)} | "
+            f"timesteps={sorted(merged.keys())[0] if merged else 'empty'}:"
+            f"{sorted(merged.keys())[-1] if merged else 'empty'}"
+        )
 
 
 RobotClient._aggregate_action_queues = _patched_aggregate_action_queues
