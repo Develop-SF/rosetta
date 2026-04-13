@@ -27,7 +27,21 @@ from lerobot.transport import (
 )
 
 # ---------------------------------------------------------------------------
-# 1. Patch _aggregate_action_queues
+# 1. Patch RobotClient.__init__ — add _observation_pending event
+# ---------------------------------------------------------------------------
+_original_init = RobotClient.__init__
+
+
+def _patched_init(self, config):
+    _original_init(self, config)
+    # Prevent sending observations back-to-back while waiting for actions
+    self._observation_pending = threading.Event()
+
+
+RobotClient.__init__ = _patched_init
+
+# ---------------------------------------------------------------------------
+# 2. Patch _aggregate_action_queues
 # ---------------------------------------------------------------------------
 
 
