@@ -256,8 +256,17 @@ RobotClient.control_loop_action = _patched_control_loop_action
 
 def _patched_ready_to_send_observation(self):
     """Flags when the client is ready to send an observation"""
+    if self._observation_pending.is_set():
+        return False
+
     with self.action_queue_lock:
-        return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+        queue_ratio = (
+            self.action_queue.qsize() / self.action_chunk_size
+            if self.action_chunk_size > 0
+            else -1.0
+        )
+
+    return queue_ratio <= self._chunk_size_threshold
 
 
 RobotClient._ready_to_send_observation = _patched_ready_to_send_observation
