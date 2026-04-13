@@ -113,7 +113,7 @@ RobotClient._aggregate_action_queues = _patched_aggregate_action_queues
 # ---------------------------------------------------------------------------
 
 
-def _patched_receive_actions(self, verbose: bool = False):
+def _patched_receive_actions(self, verbose: bool = True):
     """Receive actions from the policy server"""
     # Wait at barrier for synchronized start
     self.start_barrier.wait()
@@ -121,10 +121,9 @@ def _patched_receive_actions(self, verbose: bool = False):
 
     while self.running:
         try:
-            # Use StreamActions to get a stream of actions from the server
             actions_chunk = self.stub.GetActions(services_pb2.Empty())
             if len(actions_chunk.data) == 0:
-                continue  # received `Empty` from server, wait for next call
+                continue
 
             receive_time = time.time()
 
@@ -181,6 +180,7 @@ def _patched_receive_actions(self, verbose: bool = False):
             self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
             queue_update_time = time.perf_counter() - start_time
 
+            self._observation_pending.clear()  # allow sending a new observation
             self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
             if verbose:
