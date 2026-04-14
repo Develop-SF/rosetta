@@ -21,11 +21,9 @@ import torch
 
 from lerobot.async_inference.robot_client import RobotClient
 from lerobot.async_inference.helpers import (
-    FPSTracker,
     RawObservation,
     TimedAction,
     TimedObservation,
-    get_logger,
 )
 from lerobot.robots import openarm_follower  # noqa: F401  — register plugin
 from lerobot.transport import (
@@ -102,7 +100,7 @@ def _patched_aggregate_action_queues(
 
         self.action_queue = future_action_queue
 
-        self.logger.info(
+        self.logger.debug(
             f"Queue after merge: {future_action_queue.qsize()} actions | "
             f"latest_action={latest_action} | "
             f"existing={len(current_action_queue)} | "
@@ -119,7 +117,7 @@ RobotClient._aggregate_action_queues = _patched_aggregate_action_queues
 # ---------------------------------------------------------------------------
 
 
-def _patched_receive_actions(self, verbose: bool = True):
+def _patched_receive_actions(self, verbose: bool = False):
     """Receive actions from the policy server"""
     # Wait at barrier for synchronized start
     self.start_barrier.wait()
@@ -219,7 +217,7 @@ RobotClient.receive_actions = _patched_receive_actions
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop_action(self, verbose: bool = True) -> dict[str, Any]:
+def _patched_control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
     """Reading and performing actions in local queue"""
 
     # Lock only for queue operations
@@ -282,7 +280,7 @@ RobotClient._ready_to_send_observation = _patched_ready_to_send_observation
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop_observation(self, task: str, verbose: bool = True) -> RawObservation:
+def _patched_control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
     try:
         # Get serialized observation bytes from the function
         start_time = time.perf_counter()
@@ -315,8 +313,12 @@ def _patched_control_loop_observation(self, task: str, verbose: bool = True) -> 
             at_threshold = (not queue_empty) and (queue_ratio <= self._chunk_size_threshold)
             observation.must_go = (self.must_go.is_set() and queue_empty) or at_threshold
 
-        _ = self.send_observation(observation)
         self._observation_pending.set()  # block further observations until actions arrive
+        try:
+            _ = self.send_observation(observation)
+        except Exception:
+            self._observation_pending.clear()
+            raise
 
         self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
         if observation.must_go:
@@ -339,8 +341,9 @@ def _patched_control_loop_observation(self, task: str, verbose: bool = True) -> 
 
         return raw_observation
 
-    except Exception as e:
-        self.logger.error(f"Error in observation sender: {e}")
+    except Exception:
+        self.logger.exception("Error in observation sender")
+        raise
 
 
 RobotClient.control_loop_observation = _patched_control_loop_observation
@@ -350,7 +353,7 @@ RobotClient.control_loop_observation = _patched_control_loop_observation
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop(self, task: str, verbose: bool = True):
+def _patched_control_loop(self, task: str, verbose: bool = False):
     """Combined function for executing actions and streaming observations"""
     # Wait at barrier for synchronized start
     self.start_barrier.wait()
@@ -361,11 +364,11 @@ def _patched_control_loop(self, task: str, verbose: bool = True):
 
     while self.running:
         control_loop_start = time.perf_counter()
-        """Control loop: (1) Performing actions, when available"""
+        # Control loop: (1) Performing actions, when available
         if self.actions_available():
             _performed_action = self.control_loop_action(verbose)
 
-        """Control loop: (2) Streaming observations to the remote policy server"""
+        # Control loop: (2) Streaming observations to the remote policy server
         if self._ready_to_send_observation():
             _captured_observation = self.control_loop_observation(task, verbose)
 
