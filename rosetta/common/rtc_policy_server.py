@@ -202,6 +202,16 @@ class RTCPolicyServer(PolicyServer):
         """6. Merge into ActionQueue"""
         if self._action_queue is not None:
             inference_delay = rtc_kwargs.get("inference_delay", 0)
+            # Upstream `eval_with_real_robot.py` has a robot thread popping
+            # actions in parallel with inference, which naturally advances
+            # last_index by ~real_delay. Here the client is remote, so we
+            # simulate that consumption explicitly before merging — otherwise
+            # ActionQueue._check_and_resolve_delays warns with
+            # "indexes_diff=0, real_delay=N".
+            if self._rtc_enabled() and inference_delay > 0:
+                steps_to_consume = min(inference_delay, self._action_queue.qsize())
+                for _ in range(steps_to_consume):
+                    self._action_queue.get()
             self._action_queue.merge(
                 original_actions=original_actions,
                 processed_actions=processed_actions_2d,
