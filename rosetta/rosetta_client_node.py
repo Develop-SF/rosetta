@@ -43,6 +43,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from lerobot.async_inference.configs import RobotClientConfig
 from lerobot.async_inference.robot_client import RobotClient
 from lerobot.processor import RobotProcessorPipeline
+import rosetta.common.robot_client as _robot_client  # noqa: F401  — apply monkey-patches
 from lerobot.processor.converters import (
     observation_to_transition,
     transition_to_observation,
