@@ -34,7 +34,7 @@ from rosetta.common.obs_history import TimedObservationWithHistory
 
 # Rolling obs-history window length on the client. Must be >= any deployed
 # policy's n_obs_steps. The server trims to policy.config.n_obs_steps.
-_OBS_HISTORY_MAXLEN = 3
+_OBS_HISTORY_MAXLEN = 2
 
 # ---------------------------------------------------------------------------
 # 1. Patch RobotClient.__init__ — add _observation_pending event
@@ -305,15 +305,13 @@ def _patched_control_loop_observation(
         # Get serialized observation bytes from the function
         start_time = time.perf_counter()
 
-        # Prefer the obs captured this tick by control_loop (so the "current"
-        # obs and the history tail are the same snapshot). Fall back to a
-        # fresh capture if the tick hook hasn't run yet.
-        if self._obs_history:
-            raw_observation = self._obs_history[-1]
-        else:
-            raw_observation = self.robot.get_observation()
-            raw_observation["task"] = task
-            self._obs_history.append(raw_observation)
+        # Reuse the obs captured this tick by control_loop so the "current"
+        # obs and the history tail are the same snapshot.
+        assert self._obs_history, (
+            "_obs_history is empty; control_loop_observation was called "
+            "before control_loop captured this tick."
+        )
+        raw_observation = self._obs_history[-1]
 
         with self.latest_action_lock:
             latest_action = self.latest_action
