@@ -9,6 +9,7 @@ Monkey-patches ``RobotClient`` to:
 * Adjust ``control_loop_observation`` must-go logic for threshold-based refill.
 """
 
+import collections
 import pickle  # nosec
 import threading
 import time
@@ -23,12 +24,17 @@ from lerobot.async_inference.robot_client import RobotClient
 from lerobot.async_inference.helpers import (
     RawObservation,
     TimedAction,
-    TimedObservation,
 )
 from lerobot.robots import openarm_follower  # noqa: F401  — register plugin
 from lerobot.transport import (
     services_pb2,  # type: ignore
 )
+
+from rosetta.common.obs_history import TimedObservationWithHistory
+
+# Rolling obs-history window length on the client. Must be >= any deployed
+# policy's n_obs_steps. The server trims to policy.config.n_obs_steps.
+_OBS_HISTORY_MAXLEN = 8
 
 # ---------------------------------------------------------------------------
 # 1. Patch RobotClient.__init__ — add _observation_pending event
@@ -40,6 +46,12 @@ def _patched_init(self, config):
     _original_init(self, config)
     # Prevent sending observations back-to-back while waiting for actions
     self._observation_pending = threading.Event()
+    # Rolling window of raw observations captured at control rate (30 Hz).
+    # Sent along with each observation so the server can rebuild a 33 ms-spaced
+    # n_obs_steps history instead of relying on its stale inter-chunk deque.
+    self._obs_history: collections.deque[RawObservation] = collections.deque(
+        maxlen=_OBS_HISTORY_MAXLEN
+    )
 
 
 RobotClient.__init__ = _patched_init
@@ -285,16 +297,24 @@ def _patched_control_loop_observation(self, task: str, verbose: bool = False) ->
         # Get serialized observation bytes from the function
         start_time = time.perf_counter()
 
-        raw_observation: RawObservation = self.robot.get_observation()
-        raw_observation["task"] = task
+        # Prefer the obs captured this tick by control_loop (so the "current"
+        # obs and the history tail are the same snapshot). Fall back to a
+        # fresh capture if the tick hook hasn't run yet.
+        if self._obs_history:
+            raw_observation = self._obs_history[-1]
+        else:
+            raw_observation = self.robot.get_observation()
+            raw_observation["task"] = task
+            self._obs_history.append(raw_observation)
 
         with self.latest_action_lock:
             latest_action = self.latest_action
 
-        observation = TimedObservation(
+        observation = TimedObservationWithHistory(
             timestamp=time.time(),
             observation=raw_observation,
             timestep=max(latest_action, 0),
+            history=list(self._obs_history),  # oldest first; current obs last
         )
 
         obs_capture_time = time.perf_counter() - start_time
@@ -364,6 +384,15 @@ def _patched_control_loop(self, task: str, verbose: bool = False):
 
     while self.running:
         control_loop_start = time.perf_counter()
+
+        # Capture one observation per tick into the rolling history buffer.
+        # This preserves the 33 ms spacing that the diffusion policy was
+        # trained with. Cheap: underlying ROS subscriptions already run at
+        # 30 Hz, get_observation() just assembles the latest cached messages.
+        tick_raw_obs = self.robot.get_observation()
+        tick_raw_obs["task"] = task
+        self._obs_history.append(tick_raw_obs)
+
         # Control loop: (1) Performing actions, when available
         if self.actions_available():
             _performed_action = self.control_loop_action(verbose)

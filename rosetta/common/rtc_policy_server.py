@@ -122,6 +122,8 @@ class RTCPolicyServer(PolicyServer):
             Observation,
             raw_observation_to_observation,
         )
+        from lerobot.policies.utils import populate_queues
+        from lerobot.utils.constants import OBS_IMAGES
 
         self._ensure_action_queue()
 
@@ -139,6 +141,55 @@ class RTCPolicyServer(PolicyServer):
         observation = self.preprocessor(observation)
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
+
+        """2b. Rebuild policy._queues from the client-provided real obs history.
+
+        Async inference normally accumulates one obs per chunk (~1 s apart) in
+        the policy's internal deque, which is out-of-distribution for a
+        diffusion policy trained on 33 ms-spaced history. The client now
+        attaches a rolling window of recent raw obs; we reset the deque and
+        pre-populate it with that real 33 ms-spaced history (minus the
+        current obs, which predict_action_chunk appends itself).
+        """
+        history = getattr(observation_t, "history", None)
+        if (
+            history is not None
+            and len(history) > 1
+            and hasattr(self.policy, "reset")
+            and hasattr(self.policy, "_queues")
+        ):
+            n_obs_steps = getattr(self.policy.config, "n_obs_steps", 1)
+            # Trim to the policy's n_obs_steps; keep the oldest n-1 entries
+            # (exclude the last — that's the current obs, which the normal
+            # predict_action_chunk path will append to the deque).
+            past_history = history[-n_obs_steps:-1] if n_obs_steps > 1 else []
+
+            self.policy.reset()
+            for past_raw_obs in past_history:
+                past_obs = raw_observation_to_observation(
+                    past_raw_obs,
+                    self.lerobot_features,
+                    self.policy_image_features,
+                )
+                past_obs = self.preprocessor(past_obs)
+                # Mirror the image-stacking step done inside
+                # SNSDiffusionPolicy.predict_action_chunk: stack per-camera
+                # images into a single OBS_IMAGES key before queueing.
+                image_features = getattr(
+                    self.policy.config, "image_features", None
+                )
+                if image_features:
+                    past_obs = dict(past_obs)
+                    past_obs[OBS_IMAGES] = torch.stack(
+                        [past_obs[k] for k in image_features], dim=-4
+                    )
+                self.policy._queues = populate_queues(
+                    self.policy._queues, past_obs
+                )
+            self.logger.debug(
+                f"Pre-populated policy._queues with {len(past_history)} "
+                f"historical obs (n_obs_steps={n_obs_steps})"
+            )
 
         """3. Build RTC kwargs"""
         rtc_kwargs = {}
