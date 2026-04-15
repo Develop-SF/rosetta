@@ -34,7 +34,7 @@ from rosetta.common.obs_history import TimedObservationWithHistory
 
 # Rolling obs-history window length on the client. Must be >= any deployed
 # policy's n_obs_steps. The server trims to policy.config.n_obs_steps.
-_OBS_HISTORY_MAXLEN = 8
+_OBS_HISTORY_MAXLEN = 3
 
 # ---------------------------------------------------------------------------
 # 1. Patch RobotClient.__init__ — add _observation_pending event
@@ -100,7 +100,9 @@ def _patched_aggregate_action_queues(
                 merged[ts] = TimedAction(
                     timestamp=new_action.get_timestamp(),
                     timestep=ts,
-                    action=aggregate_fn(merged[ts].get_action(), new_action.get_action()),
+                    action=aggregate_fn(
+                        merged[ts].get_action(), new_action.get_action()
+                    ),
                 )
             else:
                 merged[ts] = new_action
@@ -158,7 +160,9 @@ def _patched_receive_actions(self, verbose: bool = False):
             if client_device != "cpu":
                 for timed_action in timed_actions:
                     if timed_action.get_action().device.type != client_device:
-                        timed_action.action = timed_action.get_action().to(client_device)
+                        timed_action.action = timed_action.get_action().to(
+                            client_device
+                        )
                 self.logger.debug(f"Converted actions to device: {client_device}")
             else:
                 self.logger.debug(f"Actions kept on device: {client_device}")
@@ -181,7 +185,9 @@ def _patched_receive_actions(self, verbose: bool = False):
                 incoming_timesteps = [a.get_timestep() for a in timed_actions]
 
                 first_action_timestep = timed_actions[0].get_timestep()
-                server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
+                server_to_client_latency = (
+                    receive_time - timed_actions[0].get_timestamp()
+                ) * 1000
 
                 self.logger.info(
                     f"Received action chunk for step #{first_action_timestep} | "
@@ -292,7 +298,9 @@ RobotClient._ready_to_send_observation = _patched_ready_to_send_observation
 # ---------------------------------------------------------------------------
 
 
-def _patched_control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+def _patched_control_loop_observation(
+    self, task: str, verbose: bool = False
+) -> RawObservation:
     try:
         # Get serialized observation bytes from the function
         start_time = time.perf_counter()
@@ -330,8 +338,12 @@ def _patched_control_loop_observation(self, task: str, verbose: bool = False) ->
                 if self.action_chunk_size > 0
                 else -1.0
             )
-            at_threshold = (not queue_empty) and (queue_ratio <= self._chunk_size_threshold)
-            observation.must_go = (self.must_go.is_set() and queue_empty) or at_threshold
+            at_threshold = (not queue_empty) and (
+                queue_ratio <= self._chunk_size_threshold
+            )
+            observation.must_go = (
+                self.must_go.is_set() and queue_empty
+            ) or at_threshold
 
         self._observation_pending.set()  # block further observations until actions arrive
         try:
@@ -340,14 +352,18 @@ def _patched_control_loop_observation(self, task: str, verbose: bool = False) ->
             self._observation_pending.clear()
             raise
 
-        self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
+        self.logger.debug(
+            f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})"
+        )
         if observation.must_go:
             # must-go event will be set again after receiving actions
             self.must_go.clear()
 
         if verbose:
             # Calculate comprehensive FPS metrics
-            fps_metrics = self.fps_tracker.calculate_fps_metrics(observation.get_timestamp())
+            fps_metrics = self.fps_tracker.calculate_fps_metrics(
+                observation.get_timestamp()
+            )
 
             self.logger.info(
                 f"Obs #{observation.get_timestep()} | "
@@ -401,9 +417,16 @@ def _patched_control_loop(self, task: str, verbose: bool = False):
         if self._ready_to_send_observation():
             _captured_observation = self.control_loop_observation(task, verbose)
 
-        self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+        self.logger.debug(
+            f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}"
+        )
         # Dynamically adjust sleep time to maintain the desired control frequency
-        time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+        time.sleep(
+            max(
+                0,
+                self.config.environment_dt - (time.perf_counter() - control_loop_start),
+            )
+        )
 
     return _captured_observation, _performed_action
 
